@@ -13,7 +13,7 @@
 
 ## News
 
-- **[2026-04]** We released pretrained checkpoints for FLM and FMLM. Download them from [Google Drive](YOUR_GOOGLE_DRIVE_LINK).
+- **[2026-04]** We released LM1B/OpenWebText checkpoints for FLM and FMLM. 
 
 ## TL;DR
 
@@ -79,31 +79,6 @@ Set `algo.teacher_path` to your pre-trained FLM checkpoint before running FMLM d
 | FMLM  | LM1B        | [scripts/train_lm1b_fmlm_denoiser.sh](scripts/train_lm1b_fmlm_denoiser.sh) |
 | FLM   | OpenWebText | [scripts/train_owt_flm.sh](scripts/train_owt_flm.sh)                       |
 | FMLM  | OpenWebText | [scripts/train_owt_fmlm_denoiser.sh](scripts/train_owt_fmlm_denoiser.sh)   |
-
-
-Appendix: Two-model distillation (older variant)
-
-These scripts correspond to the two-stage distillation described in the appendix of the paper.
-
-**Stage 1** (two-model, semigroup loss) — set `algo.teacher_path` to FLM checkpoint:
-
-
-| Dataset     | Script                                                                 |
-| ----------- | ---------------------------------------------------------------------- |
-| LM1B        | [scripts/train_lm1b_flm_distill.sh](scripts/train_lm1b_flm_distill.sh) |
-| OpenWebText | [scripts/train_owt_flm_distill.sh](scripts/train_owt_flm_distill.sh)   |
-
-
-**Stage 2** (single-model) — set `algo.teacher_f_path` to FLM and `algo.teacher_g_path` to Stage 1 checkpoint:
-
-
-| Dataset     | Script                                                                               |
-| ----------- | ------------------------------------------------------------------------------------ |
-| LM1B        | [scripts/train_lm1b_flm_distill_second.sh](scripts/train_lm1b_flm_distill_second.sh) |
-| OpenWebText | [scripts/train_owt_flm_distill_second.sh](scripts/train_owt_flm_distill_second.sh)   |
-
-
-
 
 ### Evaluation
 
