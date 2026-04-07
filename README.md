@@ -35,7 +35,7 @@ FLM applies the benefits of continuous image generation to discrete state spaces
 
 ### Pretrained Checkpoints
 
-Pretrained FLM and FMLM checkpoints are available on [Google Drive](YOUR_GOOGLE_DRIVE_LINK).
+Pretrained FLM and FMLM checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1zjHxcyoPY7FL7_SAajToGEaNvVAglGps?usp=sharing).
 
 
 | Model | Dataset     | Checkpoint       |

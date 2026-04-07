@@ -1,5 +1,5 @@
-CKPT_PATH="YOUR_CHECKPOINT_PATH"
-STEPS=512
+CKPT_PATH="/home/david3684/checkpoints/ours_flow_ce_1m.ckpt"
+STEPS=1024
 
 python -u -m main \
       mode=sample_eval \
@@ -10,7 +10,7 @@ python -u -m main \
       algo=flm \
       eval.checkpoint_path=$CKPT_PATH \
       loader.batch_size=2 \
-      loader.eval_batch_size=1 \
+      loader.eval_batch_size=32 \
       sampling.num_sample_batches=1 \
       sampling.steps=$STEPS \
       algo.double_temb=False \
