@@ -95,8 +95,6 @@ class TrainerBase(L.LightningModule):
                 config.eval.checkpoint_path, trust_remote_code=True)
             
         self._pending_ema_state = None
-        self._pending_ema_state_list = None
-        self._pending_ema_decay_list = None
         self.T = self.config.algo.T
         self.num_tokens = self.config.model.length
         self.softplus = torch.nn.Softplus()
@@ -108,21 +106,12 @@ class TrainerBase(L.LightningModule):
             gen_ppl_eval_model_name_or_path=self.config.eval.gen_ppl_eval_model_name_or_path,
             eval_ppl_batch_size=self.config.eval.perplexity_batch_size)
 
-        self.ema_decay_list = self._parse_ema_decay_list(
-            self.config.training.ema)
-        self.ema_list = {}
-        if len(self.ema_decay_list) > 0:
-            for decay in self.ema_decay_list:
-                key = self._ema_key(decay)
-                self.ema_list[key] = models.ema.ExponentialMovingAverage(
-                    self._get_parameters(),
-                    decay=decay)
-            # Keep backwards-compatible primary EMA handle
-            self.ema = self.ema_list[self._ema_key(self.ema_decay_list[0])]
-            self._active_ema_key = self._ema_key(self.ema_decay_list[0])
+        if self.config.training.ema > 0:
+            self.ema = models.ema.ExponentialMovingAverage(
+            self._get_parameters(),
+            decay=self.config.training.ema)
         else:
             self.ema = None
-            self._active_ema_key = None
 
 
         self.lr = self.config.optim.lr
@@ -145,27 +134,6 @@ class TrainerBase(L.LightningModule):
         if self.T > 0:
             assert self.parameterization != 'score'
 
-    def _parse_ema_decay_list(self, ema_value):
-        if ema_value is None:
-            return []
-        if isinstance(ema_value, str):
-            parts = [p.strip() for p in ema_value.split(',') if p.strip()]
-            return [float(p) for p in parts if float(p) > 0]
-        if isinstance(ema_value, (list, tuple, ListConfig)):
-            return [float(v) for v in ema_value if float(v) > 0]
-        return [float(ema_value)] if float(ema_value) > 0 else []
-
-    def _ema_key(self, decay):
-        return f"{float(decay):.8f}"
-
-    def _get_eval_ema_key(self):
-        if not self.ema_list:
-            return None
-        eval_decay = getattr(self.config.eval, 'ema_decay', None)
-        if eval_decay is None:
-            return self._ema_key(self.ema_decay_list[0])
-        return self._ema_key(eval_decay)
-
     def to(self, *args, **kwargs):
         self = super().to(*args, **kwargs)
         self.metrics.to(*args, **kwargs)
@@ -180,34 +148,17 @@ class TrainerBase(L.LightningModule):
 
     def _eval_mode(self):
         if self.ema and not self.config.eval.disable_ema:
-            eval_key = self._get_eval_ema_key()
-            ema_to_use = self.ema_list.get(eval_key, None) if eval_key else None
-            if ema_to_use is None:
-                eval_decay = getattr(self.config.eval, 'ema_decay', None)
-                if eval_decay is not None:
-                    raise ValueError(
-                        f"Requested eval.ema_decay={eval_decay} but EMA({eval_key}) not found in checkpoint")
-                print(f"[WARNING] EMA({eval_key}) not found; falling back to primary EMA")
-                ema_to_use = self.ema
-                self._active_ema_key = self._ema_key(self.ema.decay)
-            else:
-                self._active_ema_key = eval_key
             print('Copying EMA parameters to model')
-            ema_to_use.store(self._get_parameters())
-            ema_to_use.copy_to(self._get_parameters())
+            self.ema.store(self._get_parameters())
+            self.ema.copy_to(self._get_parameters())
         else:
             print('No EMA parameters')
         self.backbone.eval()
         self.noise.eval()
 
     def _train_mode(self):
-        if self.ema and not self.config.eval.disable_ema:
-            ema_to_use = None
-            if self._active_ema_key is not None:
-                ema_to_use = self.ema_list.get(self._active_ema_key)
-            if ema_to_use is None:
-                ema_to_use = self.ema
-            ema_to_use.restore(self._get_parameters())
+        if self.ema:
+            self.ema.restore(self._get_parameters())
         self.backbone.train()
         self.noise.train()
 
@@ -257,50 +208,16 @@ class TrainerBase(L.LightningModule):
                 import models.ema
                 self.ema = models.ema.ExponentialMovingAverage(
                     list(self._get_parameters()),
-                    decay=self.ema_decay_list[0] if len(self.ema_decay_list) > 0 else self.config.training.ema
+                    decay=self.config.training.ema
                 )
 
-            # Load additional EMA states (if any)
-            ema_list_sd = getattr(self, "_pending_ema_state_list", None)
-            ema_decay_list_sd = getattr(self, "_pending_ema_decay_list", None)
-            if isinstance(ema_list_sd, dict):
-                if isinstance(ema_decay_list_sd, (list, tuple, ListConfig)):
-                    for decay in ema_decay_list_sd:
-                        key = self._ema_key(decay)
-                        if key not in self.ema_list:
-                            self.ema_list[key] = models.ema.ExponentialMovingAverage(
-                                list(self._get_parameters()),
-                                decay=float(decay))
-                for key, state in ema_list_sd.items():
-                    ema_obj = self.ema_list.get(key)
-                    if ema_obj is None:
-                        # best-effort: parse decay from key
-                        try:
-                            decay = float(key)
-                            ema_obj = models.ema.ExponentialMovingAverage(
-                                list(self._get_parameters()),
-                                decay=decay)
-                            self.ema_list[key] = ema_obj
-                        except Exception:
-                            print(f"[WARNING] EMA key {key} could not be parsed; skipping")
-                            continue
-                    try:
-                        ema_obj.load_state_dict(state)
-                    except Exception as e:
-                        print(f"[WARNING] Failed to load EMA({key}) state: {e}")
-
             self._pending_ema_state = None
-            self._pending_ema_state_list = None
-            self._pending_ema_decay_list = None
 
         return ret
 
     def on_load_checkpoint(self, checkpoint):
         if self.ema:
             self._pending_ema_state = checkpoint.get('ema', None)
-        if self.ema_list and len(self.ema_list) > 1:
-            self._pending_ema_state_list = checkpoint.get('ema_list', None)
-            self._pending_ema_decay_list = checkpoint.get('ema_decay_list', None)
         # Copied from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
         self.fast_forward_epochs = checkpoint['loops'][
@@ -312,12 +229,6 @@ class TrainerBase(L.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         if self.ema:
             checkpoint['ema'] = self.ema.state_dict()
-        if self.ema_list and len(self.ema_list) > 1:
-            checkpoint['ema_list'] = {
-                self._ema_key(decay): self.ema_list[self._ema_key(decay)].state_dict()
-                for decay in self.ema_decay_list
-            }
-            checkpoint['ema_decay_list'] = list(self.ema_decay_list)
         # Copied from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
         # ['epoch_loop.batch_progress']['total']['completed']
@@ -357,9 +268,6 @@ class TrainerBase(L.LightningModule):
     def on_train_start(self):
         if self.ema:
             self.ema.move_shadow_params_to_device(self.device)
-        if self.ema_list and len(self.ema_list) > 1:
-            for ema_obj in self.ema_list.values():
-                ema_obj.move_shadow_params_to_device(self.device)
         # Adapted from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
         distributed = (
@@ -392,9 +300,8 @@ class TrainerBase(L.LightningModule):
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
-        if self.ema_list:
-            for ema_obj in self.ema_list.values():
-                ema_obj.update(self._get_parameters())
+        if self.ema:
+            self.ema.update(self._get_parameters())
 
     def _process_sigma(self, sigma):
         raise NotImplementedError
@@ -402,24 +309,16 @@ class TrainerBase(L.LightningModule):
     def _process_model_output(self, model_output, xt, sigma):
         raise NotImplementedError
 
-    def forward(self, xt, sigma, sigma_prime=None, use_auxiliary_head=False):
+    def forward(self, xt, sigma, sigma_prime=None):
 
         sigma = self._process_sigma(sigma)
         if sigma_prime is not None:
             sigma_prime = self._process_sigma(sigma_prime)
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, sigma, sigma_prime, use_auxiliary_head=use_auxiliary_head)
-        
-        if isinstance(model_output, (tuple, list)):
-            return tuple(self._process_model_output(mo, xt, sigma) for mo in model_output)
+            model_output = self.backbone(xt, sigma, sigma_prime)
         
         return self._process_model_output(
             model_output=model_output, xt=xt, sigma=sigma)
-
-    def forward_double_timestep(self, xt, t, r, is_warmup=True):
-        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone._forward_double_timestep(xt, t, r, is_warmup)
-        return model_output.log_softmax(dim=-1)
 
     def on_train_epoch_start(self):
         self.metrics.reset()
@@ -667,8 +566,8 @@ class Diffusion(TrainerBase):
     def _validate_configuration(self):
         super()._validate_configuration()
         assert self.config.sampling.noise_removal in {
-            'none', 'ancestral', 'greedy', 'flow', 'meanflow'}
-        assert self.config.training.loss_type in {'elbo', 'low_var', 'mse', 'adaptive_l2', 'flow', 'meanflow'}
+            'none', 'ancestral', 'greedy', 'flow'}
+        assert self.config.training.loss_type in {'elbo', 'low_var', 'mse', 'adaptive_l2', 'flow'}
         if self.config.sampling.noise_removal == 'greedy':
             assert self.sampler != 'analytic'
             assert self.parameterization in {'mean', 'subs'}
@@ -688,44 +587,18 @@ class Diffusion(TrainerBase):
 
     def _sample_t(self, n, accum_step):
         if accum_step is not None:
-            # During training
             batch_dim = n
             n = self.config.loader.global_batch_size
         _eps_t = torch.rand(n, device=self.device)
         if self.antithetic_sampling:
             offset = torch.arange(n, device=self.device) / n
             _eps_t = (_eps_t / n + offset) % 1
-        t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps  # wtf is this?
+        t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps  
         if accum_step is not None:
             t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
             t = t.chunk(self.trainer.num_devices)[self.trainer.local_rank]
             t = t.chunk(self.trainer.accumulate_grad_batches)[
                 accum_step]
-            # corner case for the last datapoint
-            t = t[:batch_dim]
-        return t
-
-    def _sample_t_interval(self, n, accum_step):
-        if accum_step is not None:
-            # During training
-            batch_dim = n
-            n = self.config.loader.global_batch_size
-        _eps_t = torch.rand(n, device=self.device)
-        if self.antithetic_sampling:
-            offset = torch.arange(n, device=self.device) / n
-            _eps_t = (_eps_t / n + offset) % 1
-            perm = torch.randperm(n, device=self.device)
-            _eps_t = _eps_t[perm]
-        # t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps # wtf is this?
-        t_min = self.config.algo.t_min  # e.g., 0.01
-        t_max = self.config.algo.t_max
-        t = (t_max - t_min) * _eps_t + t_min
-        if accum_step is not None:
-            t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
-            t = t.chunk(self.trainer.num_devices)[self.trainer.local_rank]
-            t = t.chunk(self.trainer.accumulate_grad_batches)[
-                accum_step]
-            # corner case for the last datapoint
             t = t[:batch_dim]
         return t
 

@@ -9,7 +9,8 @@ outputs/
 
 # Generated samples
 samples/
-
+tex/
+CLAUDE.md
 # Precomputed integrals (regenerate via: python utils.py)
 integral/
 

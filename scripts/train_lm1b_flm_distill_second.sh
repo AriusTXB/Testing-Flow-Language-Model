@@ -11,7 +11,7 @@ python -u -m main \
     wandb.project=flm_distill \
     wandb.name=second_phase_distill \
     model=small \
-    algo=flm_distill_double \
+    algo=fmlm_twostage \
     algo.teacher_f_path=$TEACHER_F_PATH \
     algo.teacher_g_path=$TEACHER_G_PATH \
     trainer.max_steps=1000000 \

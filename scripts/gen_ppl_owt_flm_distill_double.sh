@@ -7,7 +7,7 @@ python -u -m main \
       model=small \
       model.length=1024 \
       data=openwebtext-split \
-      algo=flm_distill_double \
+      algo=fmlm_twostage \
       eval.checkpoint_path=$CKPT_PATH \
       loader.batch_size=2 \
       loader.eval_batch_size=1 \

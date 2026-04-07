@@ -10,7 +10,7 @@ python -u -m main \
     model=small \
     model.length=1024 \
     data=lm1b-wrap \
-    algo=flm_shortcut_distill \
+    algo=fmlm_twomodel \
     algo.teacher_path=$TEACHER_CKPT_PATH \
     eval.checkpoint_path=$CKPT_PATH \
     loader.batch_size=2 \

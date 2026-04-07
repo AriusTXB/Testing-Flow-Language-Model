@@ -15,6 +15,7 @@ import models
 from torch.func import functional_call
 from models.dit import modulate_fused
 import functools
+from entmax import entmax_bisect
 
 class AR(trainer_base.TrainerBase):
     def __init__(self, config, tokenizer):
@@ -798,6 +799,11 @@ class FLMBase(trainer_base.TrainerBase):
         self.t_min = config.algo.t_min
         self.t_max = config.algo.t_max
         self.lut_a2g, self.lut_g2a = utils.build_luts(K=self.vocab_size)
+        self._is_resuming = (
+            config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)
+        )
 
     def _validate_configuration(self):
         pass
@@ -819,14 +825,13 @@ class FLMBase(trainer_base.TrainerBase):
         assert sigma.ndim == 1, sigma.shape
         return sigma
 
-    def _process_model_output(self, model_output, xt, sigma):
+    def _process_model_output(self, model_output, xt, sigma, cap_value = 30.0):
         del xt, sigma
+        model_output = cap_value * torch.tanh(model_output / cap_value)
         return model_output.log_softmax(dim=-1)
 
     def _process_model_input(self, x0, valid_tokens):
         return x0, None, valid_tokens
-
-    # ── loss dispatch ─────────────────────────────────────────
 
     def _loss(self, x0, valid_tokens,
               current_accumulation_step=None,
@@ -885,12 +890,13 @@ class FLMBase(trainer_base.TrainerBase):
             t = t[:batch_dim]
         return t
 
-    def _alpha_t_to_gamma(self, alpha_t):
-        """Convert discrete time schedule alpha_t to continuous gamma_t."""
-        return utils.alpha_to_gamma(alpha_t, self.lut_a2g)
+    def _tau_to_t(self, tau):
+        """Convert discrete time tau to continuous time t."""
+        return utils.alpha_to_gamma(tau, self.lut_a2g)
 
-    def _gamma_to_alphat(self, gamma_t):
-        return utils.gamma_to_alpha(gamma_t, self.lut_g2a)
+    def _t_to_tau(self, t):
+        """Convert continuous time t to discrete time tau."""
+        return utils.gamma_to_alpha(t, self.lut_g2a)
 
     # ── corruption ────────────────────────────────────────────
 
@@ -906,6 +912,23 @@ class FLMBase(trainer_base.TrainerBase):
 
     def load_state_dict(self, state_dict, strict=True):
         return super().load_state_dict(state_dict, strict=False)
+
+    def on_load_checkpoint(self, checkpoint):
+        print("Resuming training from checkpoint...")
+        self._is_resuming = True
+        if 'state_dict' in checkpoint:
+            checkpoint['state_dict'] = self._filter_checkpoint_state_dict(
+                checkpoint['state_dict'])
+        if self.config.mode == 'sample_eval':
+            if getattr(self.backbone, 'learnable_loss_weighting', None) is not None:
+                if not any(k.startswith('backbone.learnable_loss_weighting')
+                           for k in checkpoint['state_dict'].keys()):
+                    print("Learnable_loss_weighting not found in checkpoint. "
+                          "Initializing from scratch for eval mode.")
+                    for name, param in self.backbone.learnable_loss_weighting.named_parameters():
+                        param_key = f'backbone.learnable_loss_weighting.{name}'
+                        checkpoint['state_dict'][param_key] = param.data.clone()
+        super().on_load_checkpoint(checkpoint)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint['state_dict'] = collections.OrderedDict(
@@ -923,18 +946,14 @@ class FLMBase(trainer_base.TrainerBase):
             new_state_dict[new_key] = v
         return new_state_dict
 
-    # ── forward helpers ───────────────────────────────────────
-
-    def forward_no_softmax(self, xt, sigma, sigma_prime=None, **kwargs):
+    def forward_no_softmax(self, xt, tau, tau_prime=None, **kwargs):
         """Forward through backbone without log-softmax."""
-        sigma = self._process_sigma(sigma)
-        if sigma_prime is not None:
-            sigma_prime = self._process_sigma(sigma_prime)
+        tau = self._process_sigma(tau)
+        if tau_prime is not None:
+            tau_prime = self._process_sigma(tau_prime)
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.backbone(xt, sigma, sigma_prime, **kwargs)
+            model_output = self.backbone(xt, tau, tau_prime, **kwargs)
         return model_output
-
-    # ── teacher model utilities ───────────────────────────────
 
     def _extract_ema_state_dict(self, model, checkpoint):
         """Extract EMA parameters from checkpoint into a state_dict for model."""
@@ -1034,36 +1053,20 @@ class FLMBase(trainer_base.TrainerBase):
 class FLM(FLMBase):
     """Flow Language Model – continuous-time flow matching training."""
 
-    def on_load_checkpoint(self, checkpoint):
-        if 'state_dict' in checkpoint:
-            checkpoint['state_dict'] = self._filter_checkpoint_state_dict(
-                checkpoint['state_dict'])
-            # In eval mode, allow loading checkpoints without learnable_loss_weighting
-            if self.config.mode == 'sample_eval':
-                if getattr(self.backbone, 'learnable_loss_weighting', None) is not None:
-                    if not any(k.startswith('backbone.learnable_loss_weighting')
-                               for k in checkpoint['state_dict'].keys()):
-                        print("Learnable_loss_weighting not found in checkpoint. "
-                              "Initializing from scratch for eval mode.")
-                        for name, param in self.backbone.learnable_loss_weighting.named_parameters():
-                            param_key = f'backbone.learnable_loss_weighting.{name}'
-                            checkpoint['state_dict'][param_key] = param.data.clone()
-        super().on_load_checkpoint(checkpoint)
-
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
-        t = self._sample_t_interval(B, current_accumulation_step,
+        tau_t = self._sample_t_interval(B, current_accumulation_step,
                                     t_min=self.t_min, t_max=self.t_max)
-        c_t = self._alpha_t_to_gamma(t)
-        x_t, target_data = self.corrupt_continuous(x0, c_t)
-        f = self.forward(x_t, t)
+        t = self._tau_to_t(tau_t)
+        x_t, target_data = self.corrupt_continuous(x0, t)
+        f = self.forward(x_t, tau_t) #condition on tau_t
         tfm_loss = -(target_data * f).sum(dim=-1)
 
         if self.config.algo.learnable_loss_weighting is True:
-            loss_weight = self.backbone.learnable_loss_weighting(t)
+            loss_weight = self.backbone.learnable_loss_weighting(tau_t)
             loss_weight = loss_weight.unsqueeze(-1)
             tfm_loss = torch.exp(-loss_weight) * tfm_loss + loss_weight
         return tfm_loss
@@ -1078,30 +1081,30 @@ class FLM(FLMBase):
         L = self.num_tokens
         device = self.device
 
-        t_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
         z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
 
         for i in range(num_steps):
-            t_curr = t_vals[i]
-            t_next = t_vals[i + 1]
-            t_in = t_curr.expand(B)
-            c_t_in = self._alpha_t_to_gamma(t_in)
-            c_d_in = self._alpha_t_to_gamma(t_next.expand(B)) - c_t_in
-            x_1_pred = self.forward(z, t_in)
+            tau_t_curr = tau_vals[i]
+            tau_t_next = tau_vals[i + 1]
+            tau_t_in = tau_t_curr.expand(B)
+            t_in = self._tau_to_t(tau_t_in)
+            dt = self._tau_to_t(tau_t_next.expand(B)) - t_in
+            x_1_pred = self.forward(z, tau_t_in)
             x_1_pred_probs = x_1_pred.exp()
 
             if i == num_steps - 1:
                 z = x_1_pred_probs
                 break
 
-            v = (x_1_pred_probs - z) / (1.0 - c_t_in.view(-1, 1, 1) + 1e-5)
-            z = z + c_d_in.view(-1, 1, 1) * v
+            v = (x_1_pred_probs - z) / (1.0 - t_in.view(-1, 1, 1) + 1e-5)
+            z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
 
 
-class FLM_distill(FLMBase):
-    """FLM distillation."""
+class FMLM_TwoModel(FLMBase):
+    """FMLM two-model parameterization (appendix: semigroup loss, first stage of two-stage MSE distillation)."""
 
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -1111,8 +1114,6 @@ class FLM_distill(FLMBase):
             config.checkpointing.resume_from_ckpt
             and config.checkpointing.resume_ckpt_path is not None
         )
-
-    # ── teacher / student initialization ──────────────────────
 
     def setup(self, stage: str):
         if self.teacher_model is None:
@@ -1135,15 +1136,9 @@ class FLM_distill(FLMBase):
 
     # ── checkpoint hooks ──────────────────────────────────────
 
-    def on_load_checkpoint(self, checkpoint):
-        print("Resuming training from checkpoint...")
-        self._is_resuming = True
+    def _on_load_checkpoint_extra(self, checkpoint):
         if self.config.mode == 'sample_eval':
             self._initialize_teacher()
-        if 'state_dict' in checkpoint:
-            checkpoint['state_dict'] = self._filter_checkpoint_state_dict(
-                checkpoint['state_dict'])
-        super().on_load_checkpoint(checkpoint)
 
     def on_train_start(self):
         super().on_train_start()
@@ -1155,13 +1150,13 @@ class FLM_distill(FLMBase):
 
     # ── teacher forward ───────────────────────────────────────
 
-    def teacher_forward(self, xt, t):
+    def teacher_forward(self, xt, tau):
         """Forward through teacher model (returns log-probabilities)."""
-        sigma = self._process_sigma(t)
+        tau = self._process_sigma(tau)
         with torch.no_grad():
             with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-                model_output = self.teacher_model(xt, sigma)
-        return self._process_model_output(model_output, xt, sigma)
+                model_output = self.teacher_model(xt, tau)
+        return self._process_model_output(model_output, xt, tau)
 
     # ── loss ──────────────────────────────────────────────────
 
@@ -1171,66 +1166,63 @@ class FLM_distill(FLMBase):
         del given_t, not_sampling_t, output_tokens
         B = x0.shape[0]
 
-        d_sc = self._sample_t_interval(
+        d_tau = self._sample_t_interval(
             B, current_accumulation_step, t_min=0.0, t_max=1.0).clamp(min=1e-6)
-        t_sc = torch.rand(B, device=self.device) * (1.0 - d_sc)
+        tau_s = torch.rand(B, device=self.device) * (1.0 - d_tau)
         if self.config.algo.add_boundary:
             p_boundary = 1.0 / self.config.algo.boundary_prob
             is_boundary = torch.rand(B, device=self.device) < p_boundary
-            t_sc = torch.where(is_boundary, torch.tensor(0.0, device=self.device), t_sc)
-            d_sc = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_sc)
+            tau_s = torch.where(is_boundary, torch.tensor(0.0, device=self.device), tau_s)
+            d_tau = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_tau)
 
-        c_t_sc = self._alpha_t_to_gamma(t_sc)
-        x_t_sc, _ = self.corrupt_continuous(x0, c_t_sc)
-        f_final_sc = self.forward_no_softmax(x_t_sc, t_sc, t_sc + d_sc)
+        t_s = self._tau_to_t(tau_s)
+        x_t_s, _ = self.corrupt_continuous(x0, t_s)
+        f_final_sc = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau)
 
         with torch.no_grad():
-            d_half = d_sc / 2.0
-            c_t_sc_view = c_t_sc.view(-1, 1, 1)
+            d_tau_half = d_tau / 2.0
+            t_s = t_s.view(-1, 1, 1)
 
-            c_t_mid = self._alpha_t_to_gamma(t_sc + d_half).view(-1, 1, 1)
-            c_t_end = self._alpha_t_to_gamma(t_sc + d_sc).view(-1, 1, 1)
-            c_d_half_1 = c_t_mid - c_t_sc_view
-            c_d_half_2 = c_t_end - c_t_mid
-            c_d_sc = c_t_end - c_t_sc_view
-            c_t_sc = c_t_sc_view
+            t_mid = self._tau_to_t(tau_s + d_tau_half).view(-1, 1, 1)
+            t_e = self._tau_to_t(tau_s + d_tau).view(-1, 1, 1)
+            dt_half_1 = t_mid - t_s
+            dt_half_2 = t_e - t_mid
+            dt = t_e - t_s
 
-            f_theta_s = self.teacher_forward(x_t_sc, t_sc).exp()
-            v_s_hat = (f_theta_s - x_t_sc) / (1.0 - c_t_sc + 1e-5)
-            g_theta_s_u = self.forward_no_softmax(x_t_sc, t_sc, t_sc + d_half)
+            f_theta_s = self.teacher_forward(x_t_s, tau_s).exp()
+            v_s_hat = (f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
+            g_theta_s_u = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau_half)
 
             # v_su_hat = v_s(x_s) + 1/2(u-s)g_theta(x_s,u)
-            v_s_u_hat = ((f_theta_s - x_t_sc) / (1.0 - c_t_sc + 1e-5)
-                         + (c_d_half_1) / 2.0 * g_theta_s_u)
+            v_s_u_hat = ((f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
+                         + dt_half_1 / 2.0 * g_theta_s_u)
 
             # F_s,u(x_s) = x_s + (u-s)v_s(x_s) + 1/2(u-s)^2 g_theta(x_s,u)
-            large_f_s_u = (x_t_sc + c_d_half_1 * v_s_hat
-                           + 0.5 * c_d_half_1 ** 2 * g_theta_s_u)
+            large_f_s_u = (x_t_s + dt_half_1 * v_s_hat
+                           + 0.5 * dt_half_1 ** 2 * g_theta_s_u)
 
-            f_theta_u = self.teacher_forward(large_f_s_u, t_sc + d_half).exp()
-            v_u_hat = (f_theta_u - large_f_s_u) / (1.0 - c_t_mid + 1e-5)
+            f_theta_u = self.teacher_forward(large_f_s_u, tau_s + d_tau_half).exp()
+            v_u_hat = (f_theta_u - large_f_s_u) / (1.0 - t_mid + 1e-5)
             g_theta_u_t = self.forward_no_softmax(
-                large_f_s_u, t_sc + d_half, t_sc + d_sc)
+                large_f_s_u, tau_s + d_tau_half, tau_s + d_tau)
 
             # v_u,t_hat(x_u') = v_u(x_u') + 1/2*(t-u)*g_theta(x_u',u, t)
-            v_u_t_hat = v_u_hat + (c_d_half_2) / 2.0 * g_theta_u_t
+            v_u_t_hat = v_u_hat + dt_half_2 / 2.0 * g_theta_u_t
 
-            t_minus_s = c_d_sc
-            v_hat = (c_d_half_1 * v_s_u_hat
-                     + c_d_half_2 * v_u_t_hat) / t_minus_s
+            v_hat = (dt_half_1 * v_s_u_hat + dt_half_2 * v_u_t_hat) / dt
 
             # x_1_hat = stopgrad(x_s + (1-s)*v_hat)
-            x_boot = x_t_sc + (1.0 - c_t_sc) * v_hat
+            x_boot = x_t_s + (1.0 - t_s) * v_hat
             x_boot = x_boot.detach()
 
         f_final_fm = f_theta_s
-        weight = 0.5 * c_d_sc * (1.0 - c_t_sc)
+        weight = 0.5 * dt * (1.0 - t_s)
         f_final = f_final_fm + weight * f_final_sc
         error = x_boot - f_final  # (B, L, V)
         loss = (error ** 2).mean(dim=-1) * self.vocab_size  # (B, L)
 
         if self.config.algo.learnable_loss_weighting is True:
-            loss_weight = self.backbone.learnable_loss_weighting(t_sc, t_sc + d_sc)
+            loss_weight = self.backbone.learnable_loss_weighting(tau_s, tau_s + d_tau)
             loss_weight = loss_weight.unsqueeze(-1)
             loss = torch.exp(-loss_weight) * loss + loss_weight
 
@@ -1249,26 +1241,26 @@ class FLM_distill(FLMBase):
         device = self.device
 
         z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
-        t_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
 
         for i in range(num_steps):
-            t_curr = t_vals[i]
-            t_next = t_vals[i + 1]
-            t_in = t_curr.expand(B)
-            c_t_in = self._alpha_t_to_gamma(t_in)
-            c_d_in = self._alpha_t_to_gamma(t_next.expand(B)) - c_t_in
+            tau_curr = tau_vals[i]
+            tau_next = tau_vals[i + 1]
+            tau_in = tau_curr.expand(B)
+            t_in = self._tau_to_t(tau_in)
+            dt_in = self._tau_to_t(tau_next.expand(B)) - t_in
 
-            x_1_pred_fm = self.teacher_forward(z, t_in).exp()
-            x_1_pred_sc = self.forward_no_softmax(z, t_in, t_next.expand(B))
-            v_pred = (x_1_pred_fm - z) / (1.0 - c_t_in.view(-1, 1, 1) + eps)
-            z = (z + v_pred * c_d_in.view(-1, 1, 1)
-                 + 0.5 * (c_d_in.view(-1, 1, 1) ** 2) * x_1_pred_sc)
+            x_1_pred_fm = self.teacher_forward(z, tau_in).exp()
+            x_1_pred_sc = self.forward_no_softmax(z, tau_in, tau_next.expand(B))
+            v_pred = (x_1_pred_fm - z) / (1.0 - t_in.view(-1, 1, 1) + eps)
+            z = (z + v_pred * dt_in.view(-1, 1, 1)
+                 + 0.5 * (dt_in.view(-1, 1, 1) ** 2) * x_1_pred_sc)
 
         return z.argmax(dim=-1)
 
 
-class FLM_distill_double(FLMBase):
-    """FLM second-phase distillation."""
+class FMLM_TwoStage(FLMBase):
+    """FMLM two-stage distillation (appendix: second stage compresses two-model teacher into single model)."""
 
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -1305,14 +1297,6 @@ class FLM_distill_double(FLMBase):
         self._copy_teacher_weights_to_student(self.teacher_model_f.state_dict())
 
     # ── checkpoint hooks ──────────────────────────────────────
-
-    def on_load_checkpoint(self, checkpoint):
-        print("Resuming training from checkpoint...")
-        self._is_resuming = True
-        if 'state_dict' in checkpoint:
-            checkpoint['state_dict'] = self._filter_checkpoint_state_dict(
-                checkpoint['state_dict'])
-        super().on_load_checkpoint(checkpoint)
 
     def on_train_start(self):
         super().on_train_start()
@@ -1384,32 +1368,556 @@ class FLM_distill_double(FLMBase):
     # ── sampling ──────────────────────────────────────────────
 
     @torch.no_grad()
-    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
-        """Generate samples using flow map."""
+    def generate_samples(self, num_samples, num_steps=None,
+                        eps=1e-5):
+        """
+        Generate samples using CTM-style gamma-sampling.
+        When gamma_sampling=0, this exactly recovers the original Euler deterministic path.
+        """
         if num_steps is None:
             num_steps = self.config.sampling.steps
-        print(f" sampling step {num_steps}")
+        gamma = getattr(self.config.sampling, 'gamma', 0.0)
+        print(f"Sampling with {num_steps} steps and gamma={gamma}")
         B = num_samples
         V = self.vocab_size
         L = self.num_tokens
         device = self.device
 
-        t_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        # Time grid in alpha space [0, 1]
+        alpha_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)  
+        z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
+        
+        for i in range(num_steps):                 
+            alpha_s = alpha_vals[i]
+            alpha_next = alpha_vals[i + 1]
+            
+            # Current physical time
+            s_in = self._alpha_t_to_gamma(alpha_s.expand(B))
+            
+            # 1. Calculate Target Physical Time via Gamma-Stochasticity logic
+            # For OTFlow: sigma = (1 - t). 
+            # CTM logic: sigma_tilde = sigma_target * sqrt(1 - gamma^2)
+            t_target_phys = self._alpha_t_to_gamma(alpha_next.expand(B))
+            sigma_target = 1.0 - t_target_phys
+            
+            sigma_tilde = sigma_target * torch.sqrt(torch.tensor(1.0 - gamma**2))
+            t_tilde = 1.0 - sigma_tilde # Intermediate physical jump point
+            
+            alpha_tilde = self._gamma_to_alphat(t_tilde) # Inverse mapping required
+            
+            log_D_st_pred = self.forward(z, alpha_s.expand(B), alpha_tilde)
+            D_st_pred = log_D_st_pred.exp()
+            print(self.tokenizer.decode(D_st_pred.argmax(dim=-1)[0]))
+
+            if i == num_steps - 1:
+                # At gamma_sampling=0, t_tilde is exactly 1.0, making weights (0, 1)
+                z = D_st_pred
+                break
+
+            weight_z = (1.0 - t_tilde.view(-1, 1, 1)) / (1.0 - s_in.view(-1, 1, 1))
+            weight_D = (t_tilde.view(-1, 1, 1) - s_in.view(-1, 1, 1)) / (1.0 - s_in.view(-1, 1, 1))
+
+            z_tilde = weight_z * z + weight_D * D_st_pred
+
+            if gamma > 0:
+                noise_std = gamma * sigma_target.view(-1, 1, 1)
+
+                mean_adjustment = (sigma_tilde.view(-1, 1, 1) - sigma_target.view(-1, 1, 1))
+                
+                z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
+            else:
+                z = z_tilde
+        print(self.tokenizer.decode(z.argmax(dim=-1)[0]))
+        return z.argmax(dim=-1)
+    
+class FMLM(FLMBase):
+    """Flow-Map Language Model (FMLM): cross-entropy distillation via two-time denoiser (PSD / LSD / ESD).
+
+    Inherits shared utilities from FLMBase and adds:
+      - Two-time-step conditioning (s, t)
+      - Capped logit output processing
+      - Diagonal / off-diagonal loss sampling
+      - FMTG classifier guidance
+    """
+
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self._validate_configuration()
+        self.teacher_model = None
+
+
+    def setup(self, stage: str):
+        if self.teacher_model is None:
+            self._initialize_teacher()
+        if stage == 'fit' and not self._is_resuming:
+            print(">>> Initializing student from teacher...")
+            self._initialize_student_from_teacher()
+        elif self._is_resuming:
+            print(">>> Skipping student initialization (resuming from checkpoint).")
+
+    def _initialize_teacher(self):
+        path = self.config.algo.teacher_path
+        if path is None or path == "":
+            print("No teacher model specified, skipping teacher initialization")
+            return
+        self.teacher_model = self._load_teacher_model(path, use_plain_config=True)
+
+    def _initialize_student_from_teacher(self):
+        if self.teacher_model is None or not self.config.algo.initialize_student_from_teacher:
+            return
+        self._copy_teacher_weights_to_student(self.teacher_model.state_dict())
+
+    def _validate_configuration(self):
+        assert self.config.algo.double_temb == True, \
+            "FMLM denoiser requires double time-emb conditioning to be True"
+
+
+        assert type(self.config.algo.diagonal_fraction) == float, \
+            "diagonal_fraction must be a float"
+        assert 0 <= self.config.algo.diagonal_fraction <= 1, \
+            "diagonal_fraction must be between 0 and 1"
+
+        assert self.config.algo.add_boundary == 'fixed', \
+            "FMLM denoiser only coded with fixed boundary sampling procedure"
+
+        assert self.config.algo.distillation_method in ["PSD", "LSD", "ESD"], \
+            "FMLM denoiser must distill using PSD, LSD, or ESD"
+        if self.config.algo.distillation_method == "LSD":
+            assert 2 >= self.config.algo.entmax_temp_lsd >= 1, \
+                "entmax_temp_lsd must be in [1,2] for LSD distillation"
+            assert not self.config.algo.backprop_entmax_temp_lsd, \
+                "backprop_entmax_temp_lsd is not coded for LSD distillation"
+
+    def _process_model_output(self, model_output, xt, sigma, cap_value=30.0):
+        del xt, sigma
+        model_output = cap_value * torch.tanh(model_output / cap_value)
+        return model_output.log_softmax(dim=-1)
+
+    def forward(self, xt, sigma, sigma_prime=None, use_jvp_attn=False, **kwargs):
+        """Forward pass; use_jvp_attn is accepted for API compatibility but unused in FLM DIT."""
+        del use_jvp_attn
+        return super().forward(xt, sigma, sigma_prime, **kwargs)
+
+    def forward_with_ema(self, *args, **kwargs):
+        ema_to_use = self.ema
+        assert ema_to_use is not None, "EMA must be available"
+        ema_to_use.store(self._get_parameters())
+        ema_to_use.copy_to(self._get_parameters())
+        try:
+            with torch.no_grad():
+                self.backbone.eval()
+                out = self.forward(*args, **kwargs)
+            return out
+        finally:
+            ema_to_use.restore(self._get_parameters())
+            self.backbone.train()
+
+    def teacher_forward(self, xt, tau=None, d=None, use_jvp_attn=False):
+        del d, use_jvp_attn
+        sigma = tau.unsqueeze(-1) if tau.ndim == 1 else tau
+        sigma = self._process_sigma(sigma)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+                model_output = self.teacher_model(xt, sigma)
+        return self._process_model_output(model_output=model_output, xt=xt, sigma=sigma)
+
+    def teacher_forward_no_softmax(self, xt, tau):
+        """Returns capped logits from the frozen teacher (no log_softmax)."""
+        sigma = tau.unsqueeze(-1) if tau.ndim == 1 else tau
+        sigma = self._process_sigma(sigma)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+                model_output = self.teacher_model(xt, sigma)
+        cap_value = 30.0
+        return cap_value * torch.tanh(model_output / cap_value)
+
+    def _d_tau_by_d_t(self, t):
+        return utils.d_alpha_by_d_gamma(t, self.lut_g2a)
+
+    def _sample_multi_t_interval(self, n, accum_step, num_per_sample, t_min=None, t_max=None):
+        """Sample num_per_sample times from [t_min, t_max], returned sorted."""
+        if t_min is None:
+            t_min = self.t_min
+        if t_max is None:
+            t_max = self.t_max
+
+        if accum_step is not None:
+            batch_dim = n
+            total_n = self.config.loader.global_batch_size * num_per_sample
+        else:
+            batch_dim = n
+            total_n = n * num_per_sample
+
+        _eps_t = torch.rand(total_n, device=self.device)
+        if self.antithetic_sampling:
+            offset = torch.arange(total_n, device=self.device) / total_n
+            _eps_t = (_eps_t / total_n + offset) % 1
+            perm = torch.randperm(total_n, device=self.device)
+            _eps_t = _eps_t[perm]
+
+        t_all = (t_max - t_min) * _eps_t + t_min
+
+        if accum_step is not None:
+            t_all = t_all.view(-1, num_per_sample)
+            t_all = t_all.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
+            t_all = t_all.chunk(self.trainer.num_devices)[self.trainer.local_rank]
+            t_all = t_all.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+            t_all = t_all[:batch_dim]
+        else:
+            t_all = t_all.view(batch_dim, num_per_sample)
+
+        t_sorted, _ = torch.sort(t_all, dim=-1)
+        return [t_sorted[:, i] for i in range(num_per_sample)]
+
+    def _sample_gap_t_interval(self, n, accum_step, t_min=None, t_max=None):
+        """Sample (s, t) via gap sampling, guaranteeing s <= t."""
+        if t_min is None:
+            t_min = self.t_min
+        if t_max is None:
+            t_max = self.t_max
+
+        if accum_step is not None:
+            batch_dim = n
+            total_n = self.config.loader.global_batch_size
+        else:
+            batch_dim = n
+            total_n = n
+
+        eps_d = torch.rand(total_n, device=self.device)
+        if self.antithetic_sampling:
+            offset = torch.arange(total_n, device=self.device) / total_n
+            eps_d = (eps_d / total_n + offset) % 1
+            perm = torch.randperm(total_n, device=self.device)
+            eps_d = eps_d[perm]
+        d = (t_max - t_min) * eps_d
+
+        eps_s = torch.rand(total_n, device=self.device)
+        s = t_min + eps_s * ((t_max - t_min) - d)
+        t = s + d
+
+        if accum_step is not None:
+            st = torch.stack([s, t], dim=1)
+            st = st.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
+            st = st.chunk(self.trainer.num_devices)[self.trainer.local_rank]
+            st = st.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+            st = st[:batch_dim]
+            s, t = st[:, 0], st[:, 1]
+        else:
+            s = s[:batch_dim]
+            t = t[:batch_dim]
+
+        return s, t
+
+    def _get_split_indices(self, n, accum_step, ratios):
+        """Split batch indices into category sets with balanced per-GPU counts."""
+        assert sum(ratios) < 0.999, "Sum of ratios must be less than 1.0, leave one ratio out"
+
+        batch_dim = n
+        if accum_step is not None:
+            n_total = self.config.loader.global_batch_size
+            num_nodes = self.trainer.num_nodes
+            num_devices = self.trainer.num_devices
+            accum_batches = self.trainer.accumulate_grad_batches
+            node_rank = self.trainer.node_rank
+            local_rank = self.trainer.local_rank
+            current_accum = accum_step
+        else:
+            n_total = n
+            num_nodes = num_devices = accum_batches = 1
+            node_rank = local_rank = current_accum = 0
+
+        total_chunks = num_nodes * num_devices * accum_batches
+        chunk_idx = (node_rank * num_devices * accum_batches
+                     + local_rank * accum_batches
+                     + current_accum)
+
+        num_categories = len(ratios) + 1
+        global_counts = [0] * num_categories
+        net_ratio, prev_num = 0, 0
+        for i, ratio in enumerate(ratios):
+            net_ratio += ratio
+            num_a = int(n_total * net_ratio)
+            global_counts[i] = num_a - prev_num
+            prev_num = num_a
+        global_counts[-1] = n_total - prev_num
+
+        local_counts = []
+        for cnt in global_counts:
+            base, rem = divmod(cnt, total_chunks)
+            local_counts.append(base + (1 if chunk_idx < rem else 0))
+
+        local_size = sum(local_counts)
+        local_assignments = torch.empty(local_size, device=self.device, dtype=torch.long)
+        offset = 0
+        for i, cnt in enumerate(local_counts):
+            local_assignments[offset:offset + cnt] = i
+            offset += cnt
+
+        seed = self.global_step * total_chunks + chunk_idx
+        g = torch.Generator(device=self.device)
+        g.manual_seed(seed)
+        perm = torch.randperm(local_size, device=self.device, generator=g)
+        local_assignments = local_assignments[perm][:batch_dim]
+
+        return [(local_assignments == i).nonzero(as_tuple=True)[0]
+                for i in range(num_categories)]
+
+    def loss(self, x1, output_tokens,
+             current_accumulation_step=None, train_mode=False, xT=None,
+             given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t
+        del output_tokens, train_mode, xT
+        B, L = x1.shape[0], x1.shape[1]
+
+        tau_diag = self._sample_t_interval(B, current_accumulation_step,
+                                           t_min=self.t_min, t_max=self.t_max)
+        sample_sut = getattr(self.config.algo, 'sample_sut', 'gap')
+        set_midpoint = getattr(self.config.algo, 'set_midpoint', 'midpoint')
+        if self.config.algo.offdiagonal_sampling == "uniform_st":
+            if sample_sut == 'gap':
+                tau_s_offdiag, tau_t_offdiag = self._sample_gap_t_interval(
+                    B, current_accumulation_step,
+                    t_min=self.t_min, t_max=self.t_max)
+            else:  # 'individual'
+                tau_s_offdiag, tau_t_offdiag = self._sample_multi_t_interval(
+                    B, current_accumulation_step, 2,
+                    t_min=self.t_min, t_max=self.t_max)
+        else:  # uniform_diff
+            tau_d_offdiag = self._sample_t_interval(
+                B, current_accumulation_step, t_min=self.t_min, t_max=self.t_max)
+            tau_s_offdiag = self._sample_t_interval(
+                B, current_accumulation_step, t_min=self.t_min, t_max=self.t_max)
+            tau_s_offdiag = tau_s_offdiag * (1 - tau_d_offdiag)
+            tau_t_offdiag = tau_s_offdiag + tau_d_offdiag
+
+        idx_diag, idx_offdiag_bndry, idx_offdiag = self._get_split_indices(
+            B, current_accumulation_step,
+            ratios=(self.config.algo.diagonal_fraction,
+                    (1.0 - self.config.algo.diagonal_fraction)
+                    * (1.0 / self.config.algo.boundary_prob)))
+        tau_s = torch.zeros(B, device=self.device)
+        tau_t = torch.zeros(B, device=self.device)
+        tau_s[idx_diag] = tau_diag[idx_diag]
+        tau_s[idx_offdiag_bndry] = 0.0
+        tau_s[idx_offdiag] = tau_s_offdiag[idx_offdiag]
+        tau_t[idx_diag] = tau_diag[idx_diag]
+        tau_t[idx_offdiag_bndry] = 1.0
+        tau_t[idx_offdiag] = tau_t_offdiag[idx_offdiag]
+
+        tau_s = torch.clamp(tau_s, 0.0, 1.0)
+        tau_t = torch.clamp(tau_t, 0.0, 1.0)
+
+        idx_offdiag = torch.cat([idx_offdiag, idx_offdiag_bndry])
+        has_diag = idx_diag.numel() > 0
+        has_offdiag = idx_offdiag.numel() > 0
+
+        if set_midpoint == 'midpoint':
+            tau_u = 0.5 * (tau_s + tau_t)
+        else:  # random
+            tau_u = tau_s + torch.rand_like(tau_s) * (tau_t - tau_s)
+        s = self._tau_to_t(tau_s)
+        u = self._tau_to_t(tau_u)
+        t = self._tau_to_t(tau_t)
+
+        x_s, target_data = self.corrupt_continuous(x1, s)
+
+        if self.teacher_model is None or not has_diag:
+            on_diagonal_target = target_data[idx_diag]
+        else:
+            on_diagonal_target = self.teacher_forward(x_s[idx_diag], tau_s[idx_diag]).exp()
+        on_diagonal_target = stopgrad(on_diagonal_target)
+
+        if self.config.algo.distillation_method == "PSD":
+            log_D_st = self.forward(x_s, tau_s, tau_t)
+            _fwd = (self.forward_with_ema
+                    if getattr(self.config.algo, 'use_ema_for_psd_target', False)
+                    else self.forward)
+            if has_offdiag:
+                with torch.no_grad():
+                    x_s_od = x_s[idx_offdiag]
+                    s_od = s[idx_offdiag].view(-1, 1, 1)
+                    u_od = u[idx_offdiag].view(-1, 1, 1)
+                    t_od = t[idx_offdiag].view(-1, 1, 1)
+                    tau_s_od = tau_s[idx_offdiag]
+                    tau_u_od = tau_u[idx_offdiag]
+                    tau_t_od = tau_t[idx_offdiag]
+                    D_su_offdiag = _fwd(x_s_od, tau_s_od, tau_u_od).exp()
+                    X_su = ((1 - u_od) / (1 - s_od + 1e-8)) * x_s_od \
+                           + ((u_od - s_od) / (1 - s_od + 1e-8)) * D_su_offdiag
+                    D_ut_offdiag = _fwd(X_su, tau_u_od, tau_t_od).exp()
+                    lambda_sut = ((1 - t_od) * (u_od - s_od)
+                                  / ((1 - u_od) * (t_od - s_od) + 1e-8))
+                    offdiag_target = stopgrad(
+                        lambda_sut * D_su_offdiag + (1 - lambda_sut) * D_ut_offdiag)
+
+                if not self.config.algo.use_mse_loss_psd:
+                    offdiag_loss = -(offdiag_target * log_D_st[idx_offdiag]).sum(dim=-1)
+                else:
+                    offdiag_loss = F.mse_loss(
+                        log_D_st[idx_offdiag].exp(), offdiag_target,
+                        reduction='none').sum(dim=-1)
+            else:
+                offdiag_loss = x_s.new_empty((0, L))
+
+            if has_diag:
+                if not self.config.algo.use_mse_loss_psd:
+                    diag_loss = -(on_diagonal_target * log_D_st[idx_diag]).sum(dim=-1)
+                else:
+                    diag_loss = F.mse_loss(
+                        log_D_st[idx_diag].exp(), on_diagonal_target,
+                        reduction='none').sum(dim=-1)
+            else:
+                diag_loss = x_s.new_empty((0, L))
+
+            if self.config.algo.rescale_offdiag_loss_psd is True and has_offdiag:
+                offdiag_loss = offdiag_loss * (
+                    (t_od - s_od) / (1 - s_od + 1e-8)).view(-1, 1).pow(2)
+
+        elif self.config.algo.distillation_method == "ESD":
+            raise NotImplementedError
+        else: #LSD
+            use_jvp_attn = True
+
+            if has_diag:
+                log_D_st_diag = self.forward(
+                    x_s[idx_diag], tau_s[idx_diag], tau_t[idx_diag], use_jvp_attn=False)
+                diag_loss = -(on_diagonal_target * log_D_st_diag).sum(dim=-1)
+            else:
+                log_D_st_diag = x_s.new_empty((0, L, self.vocab_size))
+                diag_loss = x_s.new_empty((0, L))
+
+            if has_offdiag:
+                with torch.no_grad():
+                    x_s_od = x_s[idx_offdiag]
+                    s_od = s[idx_offdiag].view(-1, 1, 1)
+                    t_od = t[idx_offdiag].view(-1, 1, 1)
+                    tau_s_od = tau_s[idx_offdiag]
+                    tau_t_od = tau_t[idx_offdiag]
+
+                with torch.enable_grad():
+                    def forward_t(tau_t_val):
+                        return self.forward(
+                            x_s_od, tau_s_od, tau_t_val,
+                            use_jvp_attn=use_jvp_attn)
+                    tangent_t = torch.ones_like(tau_t_od)
+                    log_D_st_offdiag, grad_tau_t_log_D_st_offdiag = torch.func.jvp(
+                        forward_t, (tau_t_od,), (tangent_t,))
+                    grad_tau_t_log_D_st_offdiag = stopgrad(grad_tau_t_log_D_st_offdiag)
+
+                d_tau_by_d_t = self._d_tau_by_d_t(t_od)
+                grad_t_log_D_st_offdiag = grad_tau_t_log_D_st_offdiag * d_tau_by_d_t
+
+                with torch.no_grad():
+                    D_st = log_D_st_offdiag.exp()
+                    partial_t_D_st = D_st * grad_t_log_D_st_offdiag
+                    X_st = ((1 - t_od) / (1 - s_od + 1e-8)) * x_s_od \
+                           + ((t_od - s_od) / (1 - s_od + 1e-8)) * D_st
+                    use_teacher_for_D_t = (
+                        self.teacher_model is not None
+                        and self.config.algo.use_teacher_for_D_t_lsd)
+                    if use_teacher_for_D_t:
+                        D_t__X_st = self.teacher_forward(X_st, tau_t_od).exp()
+                    else:
+                        D_t__X_st = self.forward(
+                            X_st, tau_t_od, tau_t_od,
+                            use_jvp_attn=False).exp()
+                    offdiag_target = stopgrad(
+                        D_t__X_st
+                        - (t_od - s_od) * ((1 - t_od) / (1 - s_od + 1e-8))
+                        * partial_t_D_st)
+                    offdiag_target = entmax_bisect(
+                        offdiag_target,
+                        torch.tensor(
+                            self.config.algo.entmax_temp_lsd,
+                            dtype=torch.float32,
+                            requires_grad=self.config.algo.backprop_entmax_temp_lsd,
+                        ).to(self.device),
+                        dim=-1,
+                    )
+
+                offdiag_loss = -(offdiag_target * log_D_st_offdiag).sum(dim=-1)
+            else:
+                log_D_st_offdiag = x_s.new_empty((0, L, self.vocab_size))
+                offdiag_loss = x_s.new_empty((0, L))
+
+            log_D_st = torch.zeros(B, L, self.vocab_size, device=self.device)
+            log_D_st[idx_offdiag] = log_D_st_offdiag
+            log_D_st[idx_diag] = log_D_st_diag
+
+        loss = torch.zeros(B, L, device=self.device)
+        
+        if has_diag:
+            loss[idx_diag] = diag_loss
+            diag_loss_to_log = diag_loss.mean()
+        else:
+            diag_loss_to_log = loss.new_tensor(0.0)
+        self.log('diag_loss', diag_loss_to_log, prog_bar=True, sync_dist=True)
+        
+        if has_offdiag:
+            loss[idx_offdiag] = offdiag_loss
+            offdiag_loss_to_log = offdiag_loss.mean()
+        else:
+            offdiag_loss_to_log = loss.new_tensor(0.0)
+        self.log('offdiag_loss', offdiag_loss_to_log, prog_bar=True, sync_dist=True)
+        self.log('loss', loss.mean(), prog_bar=True, sync_dist=True)
+
+        if self.config.algo.learnable_loss_weighting is True:
+            loss_weight = self.backbone.learnable_loss_weighting(tau_s, tau_t)
+            loss_weight = loss_weight.unsqueeze(-1)
+            loss = torch.exp(-loss_weight) * loss + loss_weight
+            self.log('loss_weighted', loss.mean(), prog_bar=True, sync_dist=True)
+
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None,
+                         eps=1e-5):
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        gamma = getattr(self.config.sampling, 'gamma', 0.0)
+        print(f"Sampling with {num_steps} steps")
+        
+        B = num_samples
+        V = self.vocab_size
+        L = self.num_tokens
+        device = self.device
+
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+
+
         z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
 
         for i in range(num_steps):
-            t_curr = t_vals[i]
-            t_next = t_vals[i + 1]
-            t_in = t_curr.expand(B)
-            gamma_t_in = self._alpha_t_to_gamma(t_in)
-            c_d_in = self._alpha_t_to_gamma(t_next.expand(B)) - gamma_t_in
+            tau_curr = tau_vals[i]
+            tau_next = tau_vals[i + 1]
 
-            x_1_pred_probs = self.forward(z, t_in, t_next.expand(B)).exp()
+            t_curr = self._tau_to_t(tau_curr.expand(B))
+
+            t_next = self._tau_to_t(tau_next.expand(B))
+            sigma_target = 1.0 - t_next
+
+            sigma_tilde = sigma_target * torch.sqrt(torch.tensor(1.0 - gamma**2))
+            t_tilde = 1.0 - sigma_tilde
+            tau_tilde = self._t_to_tau(t_tilde)
+
+            log_D_st_pred = self.forward(z, tau_curr.expand(B), tau_tilde)
+            D_st_pred = log_D_st_pred.exp()
+
             if i == num_steps - 1:
-                z = x_1_pred_probs
+                z = D_st_pred
                 break
 
-            v = (x_1_pred_probs - z) / (1.0 - gamma_t_in.view(-1, 1, 1) + eps)
-            z = z + v * c_d_in.view(-1, 1, 1)
+            weight_z = (1.0 - t_tilde.view(-1, 1, 1)) / (1.0 - t_curr.view(-1, 1, 1))
+            weight_D = ((t_tilde.view(-1, 1, 1) - t_curr.view(-1, 1, 1))
+                        / (1.0 - t_curr.view(-1, 1, 1)))
+            z_tilde = weight_z * z + weight_D * D_st_pred
 
+            if gamma > 0:
+                noise_std = gamma * sigma_target.view(-1, 1, 1)
+                mean_adjustment = sigma_tilde.view(-1, 1, 1) - sigma_target.view(-1, 1, 1)
+                z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
+            else:
+                z = z_tilde
+                
         return z.argmax(dim=-1)
+

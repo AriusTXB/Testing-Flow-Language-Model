@@ -10,7 +10,7 @@ python -u -m main \
     wandb.project=lm1b_distill \
     wandb.name=flm_distill \
     model=small \
-    algo=flm_semigroup_distill \
+    algo=fmlm_twomodel \
     algo.teacher_path=$TEACHER_PATH \
     trainer.max_steps=1000000 \
     trainer.precision=bf16 \

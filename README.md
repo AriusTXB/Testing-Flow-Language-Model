@@ -7,15 +7,17 @@
 
 <div align="left">
 
-[**[Project Page]**](https://one-step-lm.github.io/) | [**[Paper]**](https://arxiv.org/abs/2602.16813)
+**[[Project Page]](https://one-step-lm.github.io/)** | **[[Paper]](https://arxiv.org/abs/2602.16813)** | **[[Blog]](https://arxiv.org/abs/2602.16813)**
 
 </div>
+
+## News
+
+- **[2026-04]** We released pretrained checkpoints for FLM and FMLM. Download them from [Google Drive](YOUR_GOOGLE_DRIVE_LINK).
 
 ## TL;DR
 
 We introduce **Flow-based Language Model (FLM)** and its flow-map distilled variant **Flow-map Language Model (FMLM)**, enabling **one-step parallel text generation** through continuous denoising. 
-
-
 
 ## Overview
 
@@ -27,11 +29,25 @@ We introduce **Flow-based Language Model (FLM)** and its flow-map distilled vari
   <img src="figures/overview.png" width="100%">
 </p>
 
+
 FLM applies the benefits of continuous image generation to discrete state spaces by encoding text as one-hot vectors and using flow matching to directly map noise to one-hot data. Unlike discrete diffusion, FLM **gradually denoises all tokens in parallel**, allowing it to represent a superposition of sequences while capturing correlations between tokens — a fundamental bottleneck for discrete diffusion in the few-step regime.
 
-
-
 ## How to Run
+
+### Pretrained Checkpoints
+
+Pretrained FLM and FMLM checkpoints are available on [Google Drive](YOUR_GOOGLE_DRIVE_LINK).
+
+
+| Model | Dataset     | Checkpoint       |
+| ----- | ----------- | ---------------- |
+| FLM   | LM1B        | `lm1b_flm.ckpt`  |
+| FMLM  | LM1B        | `lm1b_fmlm.ckpt` |
+| FLM   | OpenWebText | `owt_flm.ckpt`   |
+| FMLM  | OpenWebText | `owt_fmlm.ckpt`  |
+
+
+Set `eval.checkpoint_path` (or `algo.teacher_path` for distillation) to the downloaded checkpoint path when running evaluation or distillation scripts.
 
 ### Install Dependencies
 
@@ -54,42 +70,52 @@ With the option, we are able to train OpenWebText experiments with 512 batch siz
 
 Before running, update `data.cache_dir` in the scripts to point to your dataset location. If the directory is empty, the dataset will be automatically downloaded and preprocessed.
 
-**FLM Training** (1M steps)
+Set `algo.teacher_path` to your pre-trained FLM checkpoint before running FMLM distillation.
 
-| Dataset | Script |
-|---|---|
-| LM1B | [scripts/train_lm1b_flm.sh](scripts/train_lm1b_flm.sh) |
-| OpenWebText | [scripts/train_owt_flm.sh](scripts/train_owt_flm.sh) |
 
-**Flow Map Distillation**
+| Model | Dataset     | Script                                                                     |
+| ----- | ----------- | -------------------------------------------------------------------------- |
+| FLM   | LM1B        | [scripts/train_lm1b_flm.sh](scripts/train_lm1b_flm.sh)                     |
+| FMLM  | LM1B        | [scripts/train_lm1b_fmlm_denoiser.sh](scripts/train_lm1b_fmlm_denoiser.sh) |
+| FLM   | OpenWebText | [scripts/train_owt_flm.sh](scripts/train_owt_flm.sh)                       |
+| FMLM  | OpenWebText | [scripts/train_owt_fmlm_denoiser.sh](scripts/train_owt_fmlm_denoiser.sh)   |
 
-Set `algo.teacher_path` to your pre-trained FLM checkpoint before running.
 
-| Dataset | Script |
-|---|---|
-| LM1B | [scripts/train_lm1b_flm_distill.sh](scripts/train_lm1b_flm_distill.sh) |
-| OpenWebText | [scripts/train_owt_flm_distill.sh](scripts/train_owt_flm_distill.sh) |
+Appendix: Two-model distillation (older variant)
 
-**Second Stage Distillation** (optional)
+These scripts correspond to the two-stage distillation described in the appendix of the paper.
 
-Set `algo.teacher_path_f` to your pre-trained FLM checkpoint and `algo.teacher_path_g` to your distilled backbone from above script.
+**Stage 1** (two-model, semigroup loss) — set `algo.teacher_path` to FLM checkpoint:
 
-| Dataset | Script |
-|---|---|
-| LM1B | [scripts/train_lm1b_flm_distill_second.sh](scripts/train_lm1b_flm_distill_second.sh) |
-| OpenWebText | [scripts/train_owt_flm_distill_second.sh](scripts/train_owt_flm_distill_second.sh) |
+
+| Dataset     | Script                                                                 |
+| ----------- | ---------------------------------------------------------------------- |
+| LM1B        | [scripts/train_lm1b_flm_distill.sh](scripts/train_lm1b_flm_distill.sh) |
+| OpenWebText | [scripts/train_owt_flm_distill.sh](scripts/train_owt_flm_distill.sh)   |
+
+
+**Stage 2** (single-model) — set `algo.teacher_f_path` to FLM and `algo.teacher_g_path` to Stage 1 checkpoint:
+
+
+| Dataset     | Script                                                                               |
+| ----------- | ------------------------------------------------------------------------------------ |
+| LM1B        | [scripts/train_lm1b_flm_distill_second.sh](scripts/train_lm1b_flm_distill_second.sh) |
+| OpenWebText | [scripts/train_owt_flm_distill_second.sh](scripts/train_owt_flm_distill_second.sh)   |
+
+
+
 
 ### Evaluation
 
 Set `CKPT_PATH` in the script to your trained checkpoint before running.
 
-| Model | Dataset | Script |
-|---|---|---|
-| FLM | LM1B | [scripts/gen_ppl_lm1b_flm.sh](scripts/gen_ppl_lm1b_flm.sh) |
-| FLM | OpenWebText | [scripts/gen_ppl_owt_flm.sh](scripts/gen_ppl_owt_flm.sh) |
-| FMLM | LM1B | [scripts/gen_ppl_lm1b_flm_distill_double.sh](scripts/gen_ppl_lm1b_flm_distill_double.sh) |
-| FMLM | OpenWebText | [scripts/gen_ppl_owt_flm_distill_double.sh](scripts/gen_ppl_owt_flm_distill_double.sh) |
 
+| Model | Dataset     | Script                                                       |
+| ----- | ----------- | ------------------------------------------------------------ |
+| FLM   | LM1B        | [scripts/gen_ppl_lm1b_flm.sh](scripts/gen_ppl_lm1b_flm.sh)   |
+| FMLM  | LM1B        | [scripts/gen_ppl_lm1b_fmlm.sh](scripts/gen_ppl_lm1b_fmlm.sh) |
+| FLM   | OpenWebText | [scripts/gen_ppl_owt_flm.sh](scripts/gen_ppl_owt_flm.sh)     |
+| FMLM  | OpenWebText | [scripts/gen_ppl_owt_fmlm.sh](scripts/gen_ppl_owt_fmlm.sh)   |
 
 
 ## BibTeX
@@ -104,7 +130,6 @@ Set `CKPT_PATH` in the script to your trained checkpoint before running.
 ```
 
 ---
-
 
 ## Acknowledgements
 

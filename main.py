@@ -427,26 +427,20 @@ def main(config):
         diffusion_model = algo.DUO
     elif config.algo.name == 'flm':
         diffusion_model = algo.FLM
-    elif config.algo.name == 'flm_distill':
-        diffusion_model = algo.FLM_distill
-    elif config.algo.name == 'flm_distill_double':
-        diffusion_model = algo.FLM_distill_double
+    elif config.algo.name == 'fmlm_twomodel':
+        diffusion_model = algo.FMLM_TwoModel
+    elif config.algo.name == 'fmlm_twostage':
+        diffusion_model = algo.FMLM_TwoStage
+    elif config.algo.name == 'fmlm':
+        diffusion_model = algo.FMLM
     elif config.algo.name == 'd3pm':
         diffusion_model = algo.D3PMAbsorb
     elif config.algo.name == 'sedd':
         diffusion_model = algo.SEDDAbsorb
-    elif config.algo.name == 'dmf':
-        diffusion_model = algo.DMF
     elif config.algo.name == 'distillation':
         diffusion_model = algo.Distillation
-    elif config.algo.name == 'ot-finetune':
-        diffusion_model = algo.OptimalTransportFinetune
     elif config.algo.name == 'rectification':
         diffusion_model = algo.Rectification
-    elif config.algo.name == 'DMF':
-        diffusion_model = algo.DMF
-    elif config.algo.name == 'continuousflow':
-        diffusion_model = algo.ContinuousFlow
     else:
         raise ValueError(
             f'Invalid algorithm name: {config.algo.name}')
