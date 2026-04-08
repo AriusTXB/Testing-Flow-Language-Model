@@ -30,7 +30,7 @@
   <img src="figures/overview.png" width="100%">
 </p>
 
-We introduce **Flow-based Language Model (FLM)** and its flow-map distilled variant **Flow-map Language Model (FMLM)**, enabling **one-step parallel text generation** through continuous denoising. 
+We introduce **Flow Language Model (FLM)** and its flow-map distilled variant **Flow Map Language Model (FMLM)**, enabling **one-step parallel text generation** through continuous denoising. 
 
 ## Overview
 
