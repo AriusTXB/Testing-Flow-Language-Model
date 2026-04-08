@@ -1,6 +1,6 @@
 #!/bin/bash
-CKPT_PATH="/home/david3684/projects/discrete-mean-flow/text/outputs/lm1b/2026.03.04/063736/checkpoints/last.ckpt"
-STEPS=1
+CKPT_PATH="path/to/your/checkpoint.ckpt"
+STEPS=32
 
 python -u -m main \
       mode=sample_eval \
@@ -15,7 +15,7 @@ python -u -m main \
       sampling.num_sample_batches=8 \
       sampling.steps=$STEPS \
       algo.double_temb=True \
-      eval.disable_ema=True \
+      eval.disable_ema=False \
       algo.learnable_loss_weighting=False \
       sampling.gamma=0.8 \
       +wandb.offline=true \

@@ -1,4 +1,4 @@
-CKPT_PATH="/home/david3684/checkpoints/ours_flow_ce_1m.ckpt"
+CKPT_PATH="path/to/your/checkpoint.ckpt"
 STEPS=1024
 
 python -u -m main \

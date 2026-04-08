@@ -1,4 +1,4 @@
-CKPT_PATH="/home/david3684/checkpoints/owt_fmlm.ckpt"
+CKPT_PATH="/path/to/your/checkpoint.ckpt"
 STEPS=32
 
 python -u -m main \
