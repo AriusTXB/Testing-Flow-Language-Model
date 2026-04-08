@@ -1,11 +1,16 @@
-# One-step Language Modeling via Continuous Denoising
+<h1 align="center">Flow Map Language Models:<br>One-step Language Modeling via Continuous Denoising</h1>
 
+<div align="center">
+  
 **[Chanhyuk Lee](https://david3684.github.io)**<sup>1</sup>, **[Jaehoon Yoo](https://sites.google.com/view/jaehoon-yoo/홈)**<sup>1</sup>, **[Manan Agarwal](https://mananag007.github.io)**<sup>2</sup>, **[Sheel Shah](https://sheelfshah.github.io)**<sup>2</sup>, **[Jerry Huang](https://jrrhuang.github.io/)**<sup>2</sup>, \
 **[Aditi Raghunathan](https://www.cs.cmu.edu/~aditirag/)**<sup>2</sup>, **[Seunghoon Hong](https://maga33.github.io/)**<sup>1</sup>, **[Nicholas M. Boffi](https://nmboffi.github.io/)**<sup>†2</sup>, **[Jinwoo Kim](https://jw9730.github.io/)**<sup>†1</sup>
 
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Carnegie Mellon University &nbsp; <sup>†</sup>Equal advising
 
-<div align="left">
+
+<sup>1</sup>KAIST &nbsp; <sup>2</sup>Carnegie Mellon University &nbsp; <sup>†</sup>Equal advising
+</div>
+
+<div align="center">
 
 **[[Project Page]](https://one-step-lm.github.io/)** | **[[Paper]](https://arxiv.org/abs/2602.16813)** | **[[Blog]](https://arxiv.org/abs/2602.16813)**
 
@@ -95,11 +100,14 @@ Set `CKPT_PATH` in the script to your trained checkpoint before running.
 ## BibTeX
 
 ```bibtex
-@article{lee2026one,
-    title={One-step Language Modeling via Continuous Denoising}, 
-    author={Chanhyuk Lee and Jaehoon Yoo and Manan Agarwal and Sheel Shah and Jerry Huang and Aditi Raghunathan and Seunghoon Hong and Nicholas M. Boffi and Jinwoo Kim},
+@article{lee2026flow,
+    title={Flow Map Language Models: One-step Language Modeling via Continuous Denoising},
+    author={Chanhyuk Lee and Jaehoon Yoo and Manan Agarwal
+            and Sheel Shah and Jerry Huang
+            and Aditi Raghunathan and Seunghoon Hong
+            and Nicholas M. Boffi and Jinwoo Kim},
     journal={arXiv preprint arXiv:2602.16813},
-    year={2026}
+    year={2026},
 }
 ```
 
