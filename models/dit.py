@@ -142,11 +142,28 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin,):
     return q, k, v
 
 
-def apply_rotary_pos_emb(qkv, cos, sin):
+def apply_rotary_pos_emb(qkv, cos, sin, use_flash=True):
     cos = cos[0, :, 0, 0, :cos.shape[-1]//2]
     sin = sin[0, :, 0, 0, :sin.shape[-1]//2]
     
-    return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
+    if use_flash:
+        return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
+    else:
+        q, k, v = qkv.unbind(dim=2)
+        def apply_rotary(x, cos, sin):
+            
+            cos = cos.unsqueeze(0).unsqueeze(2)  
+            sin = sin.unsqueeze(0).unsqueeze(2)      
+            cos = torch.cat([cos, cos], dim=-1)  
+            sin = torch.cat([sin, sin], dim=-1)  
+            
+            return x * cos + rotate_half(x) * sin
+        
+        q_rotated = apply_rotary(q, cos, sin)
+        k_rotated = apply_rotary(k, cos, sin)
+        
+        return torch.stack([q_rotated, k_rotated, v], dim=2)
+
 
 
 def regular_attention_multi_headed(q, k, v, tq=None, tk=None, tv=None):
@@ -438,7 +455,7 @@ class DDiTBlock(nn.Module):
         output = torch.einsum('bhij,bhjd->bhid', attn_probs, v)  # (B, H, S, D)
         return output
     
-    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None, exclude_last_token=False):
+    def forward(self, x, rotary_cos_sin=None, c=None, seqlens=None, exclude_last_token=False, use_jvp_attn=False):
 
         bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
@@ -459,13 +476,22 @@ class DDiTBlock(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             cos, sin = rotary_cos_sin
             qkv = apply_rotary_pos_emb(
-                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype)
+                qkv, cos.to(qkv.dtype), sin.to(qkv.dtype), use_flash= not use_jvp_attn
             )
+        
+        if use_jvp_attn: #custom attention for JVP support
+            q, k, v = qkv.unbind(dim=2) 
+            q = q.transpose(1, 2)  
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
             
-        x = flash_attn.flash_attn_qkvpacked_func(
-            qkv, 0.0, causal=False,
-            softcap=self.softcap,
-            )
+            x = self.custom_sdpa(q, k, v, softcap=self.softcap)
+            x = x.transpose(1, 2)
+        else:
+            x = flash_attn.flash_attn_qkvpacked_func(
+                qkv, 0.0, causal=False,
+                softcap=self.softcap,
+                )
 
         x = einops.rearrange(x, 'b s h d -> b s (h d)',)
         
@@ -609,7 +635,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             return bias_dropout_add_scale_fused_inference
     
     @torch_compile_deco
-    def forward(self, x, sigma, sigma_prime=None):
+    def forward(self, x, sigma, sigma_prime=None, use_jvp_attn=False):
         x = self.vocab_embed(x)
             
         if self.causal:
@@ -631,8 +657,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, c=t_cond,
                                     seqlens=None, exclude_last_token=self.is_di4c, 
-                                    )
-            return self.output_layer(x, c=t_cond)
+                                    use_jvp_attn=use_jvp_attn)
+            x =  self.output_layer(x, c=t_cond)
             
         return x
 

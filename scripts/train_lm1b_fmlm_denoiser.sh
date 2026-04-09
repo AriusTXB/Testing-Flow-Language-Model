@@ -15,9 +15,6 @@ python -u -m main \
   model.length=128 \
   algo=fmlm \
   algo.double_temb=True \
-  algo.use_discrete_schedule=True \
-  algo.time_condition=alpha_t \
-  algo.loss_scale=none \
   algo.learnable_loss_weighting=False \
   algo.distillation_method=PSD \
   algo.use_mse_loss_psd=False \

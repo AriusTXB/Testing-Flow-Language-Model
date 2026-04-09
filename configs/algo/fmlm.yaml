@@ -7,14 +7,12 @@ subs_masking: False
 causal_attention: False
 t_max: 1.0
 t_min: 0.0
-use_discrete_schedule: True
-time_condition: alpha_t
-loss_scale: none
 double_temb: True
 add_boundary: fixed
 diagonal_fraction: 0.75
-offdiagonal_sampling: uniform_st
-boundary_prob: 64
+offdiagonal_sampling: uniform_diff
+set_midpoint: midpoint
+boundary_prob: 32
 distillation_method: PSD
 entmax_temp_lsd: 2.0
 backprop_entmax_temp_lsd: False
@@ -23,6 +21,5 @@ use_mse_loss_psd: False
 rescale_offdiag_loss_psd: False
 use_ema_for_psd_target: False
 use_teacher_for_D_t_lsd: False
-use_simulated_entropy: False
 initialize_student_from_teacher: False
 teacher_path: ''

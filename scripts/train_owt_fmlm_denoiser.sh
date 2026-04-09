@@ -2,8 +2,8 @@
 # Train FMLM (cross-entropy distillation) on OpenWebText.
 # Requires a pretrained FLM teacher checkpoint at TEACHER_PATH.
 
-TEACHER_PATH="/home/david3684/checkpoints/ours_owt_flow_ce_1m.ckpt"
-DATA_CACHE_DIR="/home/david3684/datasets/openwebtext"
+TEACHER_PATH="/path/to/your/teacher/checkpoint.ckpt"
+DATA_CACHE_DIR="/path/to/your/data"
 
 python -u -m main \
   loader.global_batch_size=128 \
@@ -15,9 +15,6 @@ python -u -m main \
   model.length=1024 \
   algo=fmlm \
   algo.double_temb=True \
-  algo.use_discrete_schedule=True \
-  algo.time_condition=alpha_t \
-  algo.loss_scale=none \
   algo.learnable_loss_weighting=False \
   algo.distillation_method=PSD \
   algo.use_mse_loss_psd=False \

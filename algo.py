@@ -787,11 +787,7 @@ class Rectification(DUO):  # Training as duo, without curriculum
 
 
 class FLMBase(trainer_base.TrainerBase):
-    """Base class for FLM (Flow Language Model) algorithms.
-
-    Provides shared utilities for continuous-time flow matching:
-    time scheduling, corruption, sigma processing, checkpoint
-    handling, and teacher model loading.
+    """Base class for FLM/FMLM.
     """
 
     def __init__(self, config, tokenizer):
@@ -810,8 +806,6 @@ class FLMBase(trainer_base.TrainerBase):
 
     def training_step(self, batch, batch_idx):
         return super().training_step(batch, batch_idx)
-
-    # ── sigma / model output ──────────────────────────────────
 
     def _process_sigma(self, sigma):
         if sigma.ndim == 1:
@@ -866,8 +860,6 @@ class FLMBase(trainer_base.TrainerBase):
             current_accumulation_step=None, train_mode=False):
         raise NotImplementedError
 
-    # ── time scheduling ───────────────────────────────────────
-
     def _sample_t_interval(self, n, accum_step, t_min=None, t_max=None):
         if t_min is None:
             t_min = self.t_min
@@ -898,8 +890,6 @@ class FLMBase(trainer_base.TrainerBase):
         """Convert continuous time t to discrete time tau."""
         return utils.gamma_to_alpha(t, self.lut_g2a)
 
-    # ── corruption ────────────────────────────────────────────
-
     def corrupt_continuous(self, x0, t):
         """Corrupt data x0 at time t using linear interpolation with Gaussian noise."""
         t = t.unsqueeze(-1).unsqueeze(-1)
@@ -907,8 +897,6 @@ class FLMBase(trainer_base.TrainerBase):
         noise = torch.randn_like(target_data, dtype=torch.float32)
         x_t = (1 - t) * noise + t * target_data
         return x_t, target_data
-
-    # ── checkpoint ────────────────────────────────────────────
 
     def load_state_dict(self, state_dict, strict=True):
         return super().load_state_dict(state_dict, strict=False)
@@ -947,7 +935,6 @@ class FLMBase(trainer_base.TrainerBase):
         return new_state_dict
 
     def forward_no_softmax(self, xt, tau, tau_prime=None, **kwargs):
-        """Forward through backbone without log-softmax."""
         tau = self._process_sigma(tau)
         if tau_prime is not None:
             tau_prime = self._process_sigma(tau_prime)
@@ -1051,8 +1038,6 @@ class FLMBase(trainer_base.TrainerBase):
 
 
 class FLM(FLMBase):
-    """Flow Language Model – continuous-time flow matching training."""
-
     def loss(self, x0, output_tokens,
              current_accumulation_step=None, train_mode=False,
              xT=None, given_t=None, not_sampling_t=False):
@@ -1101,344 +1086,8 @@ class FLM(FLMBase):
             z = z + dt.view(-1, 1, 1) * v
 
         return z.argmax(dim=-1)
-
-
-class FMLM_TwoModel(FLMBase):
-    """FMLM two-model parameterization (appendix: semigroup loss, first stage of two-stage MSE distillation)."""
-
-    def __init__(self, config, tokenizer):
-        super().__init__(config, tokenizer)
-        self.log_flag = False
-        self.teacher_model = None
-        self._is_resuming = (
-            config.checkpointing.resume_from_ckpt
-            and config.checkpointing.resume_ckpt_path is not None
-        )
-
-    def setup(self, stage: str):
-        if self.teacher_model is None:
-            self._initialize_teacher()
-        if stage == 'fit' and not self._is_resuming:
-            print(">>> Initializing student from teacher...")
-            self._initialize_student_from_teacher()
-        elif self._is_resuming:
-            print(">>> Skipping student initialization (resuming from checkpoint).")
-
-    def _initialize_teacher(self):
-        self.teacher_model = self._load_teacher_model(
-            self.config.algo.teacher_path, use_plain_config=True)
-
-    def _initialize_student_from_teacher(self):
-        self._copy_teacher_weights_to_student(self.teacher_model.state_dict())
-        if hasattr(self.backbone, 'output_layer'):
-            self._zero_init_module(self.backbone.output_layer)
-            print("Zero initialized student output_layer")
-
-    # ── checkpoint hooks ──────────────────────────────────────
-
-    def _on_load_checkpoint_extra(self, checkpoint):
-        if self.config.mode == 'sample_eval':
-            self._initialize_teacher()
-
-    def on_train_start(self):
-        super().on_train_start()
-        if self.teacher_model is None:
-            print("Initializing teacher model...")
-            self._initialize_teacher()
-            print("Initializing student from teacher")
-            self._initialize_student_from_teacher()
-
-    # ── teacher forward ───────────────────────────────────────
-
-    def teacher_forward(self, xt, tau):
-        """Forward through teacher model (returns log-probabilities)."""
-        tau = self._process_sigma(tau)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-                model_output = self.teacher_model(xt, tau)
-        return self._process_model_output(model_output, xt, tau)
-
-    # ── loss ──────────────────────────────────────────────────
-
-    def loss(self, x0, output_tokens,
-             current_accumulation_step=None, train_mode=False,
-             xT=None, given_t=None, not_sampling_t=False):
-        del given_t, not_sampling_t, output_tokens
-        B = x0.shape[0]
-
-        d_tau = self._sample_t_interval(
-            B, current_accumulation_step, t_min=0.0, t_max=1.0).clamp(min=1e-6)
-        tau_s = torch.rand(B, device=self.device) * (1.0 - d_tau)
-        if self.config.algo.add_boundary:
-            p_boundary = 1.0 / self.config.algo.boundary_prob
-            is_boundary = torch.rand(B, device=self.device) < p_boundary
-            tau_s = torch.where(is_boundary, torch.tensor(0.0, device=self.device), tau_s)
-            d_tau = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_tau)
-
-        t_s = self._tau_to_t(tau_s)
-        x_t_s, _ = self.corrupt_continuous(x0, t_s)
-        f_final_sc = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau)
-
-        with torch.no_grad():
-            d_tau_half = d_tau / 2.0
-            t_s = t_s.view(-1, 1, 1)
-
-            t_mid = self._tau_to_t(tau_s + d_tau_half).view(-1, 1, 1)
-            t_e = self._tau_to_t(tau_s + d_tau).view(-1, 1, 1)
-            dt_half_1 = t_mid - t_s
-            dt_half_2 = t_e - t_mid
-            dt = t_e - t_s
-
-            f_theta_s = self.teacher_forward(x_t_s, tau_s).exp()
-            v_s_hat = (f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
-            g_theta_s_u = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau_half)
-
-            # v_su_hat = v_s(x_s) + 1/2(u-s)g_theta(x_s,u)
-            v_s_u_hat = ((f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
-                         + dt_half_1 / 2.0 * g_theta_s_u)
-
-            # F_s,u(x_s) = x_s + (u-s)v_s(x_s) + 1/2(u-s)^2 g_theta(x_s,u)
-            large_f_s_u = (x_t_s + dt_half_1 * v_s_hat
-                           + 0.5 * dt_half_1 ** 2 * g_theta_s_u)
-
-            f_theta_u = self.teacher_forward(large_f_s_u, tau_s + d_tau_half).exp()
-            v_u_hat = (f_theta_u - large_f_s_u) / (1.0 - t_mid + 1e-5)
-            g_theta_u_t = self.forward_no_softmax(
-                large_f_s_u, tau_s + d_tau_half, tau_s + d_tau)
-
-            # v_u,t_hat(x_u') = v_u(x_u') + 1/2*(t-u)*g_theta(x_u',u, t)
-            v_u_t_hat = v_u_hat + dt_half_2 / 2.0 * g_theta_u_t
-
-            v_hat = (dt_half_1 * v_s_u_hat + dt_half_2 * v_u_t_hat) / dt
-
-            # x_1_hat = stopgrad(x_s + (1-s)*v_hat)
-            x_boot = x_t_s + (1.0 - t_s) * v_hat
-            x_boot = x_boot.detach()
-
-        f_final_fm = f_theta_s
-        weight = 0.5 * dt * (1.0 - t_s)
-        f_final = f_final_fm + weight * f_final_sc
-        error = x_boot - f_final  # (B, L, V)
-        loss = (error ** 2).mean(dim=-1) * self.vocab_size  # (B, L)
-
-        if self.config.algo.learnable_loss_weighting is True:
-            loss_weight = self.backbone.learnable_loss_weighting(tau_s, tau_s + d_tau)
-            loss_weight = loss_weight.unsqueeze(-1)
-            loss = torch.exp(-loss_weight) * loss + loss_weight
-
-        return loss
-
-    # ── sampling ──────────────────────────────────────────────
-
-    @torch.no_grad()
-    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
-        """Generate samples using flow map."""
-        if num_steps is None:
-            num_steps = self.config.sampling.steps
-        B = num_samples
-        V = self.vocab_size
-        L = self.num_tokens
-        device = self.device
-
-        z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
-        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
-
-        for i in range(num_steps):
-            tau_curr = tau_vals[i]
-            tau_next = tau_vals[i + 1]
-            tau_in = tau_curr.expand(B)
-            t_in = self._tau_to_t(tau_in)
-            dt_in = self._tau_to_t(tau_next.expand(B)) - t_in
-
-            x_1_pred_fm = self.teacher_forward(z, tau_in).exp()
-            x_1_pred_sc = self.forward_no_softmax(z, tau_in, tau_next.expand(B))
-            v_pred = (x_1_pred_fm - z) / (1.0 - t_in.view(-1, 1, 1) + eps)
-            z = (z + v_pred * dt_in.view(-1, 1, 1)
-                 + 0.5 * (dt_in.view(-1, 1, 1) ** 2) * x_1_pred_sc)
-
-        return z.argmax(dim=-1)
-
-
-class FMLM_TwoStage(FLMBase):
-    """FMLM two-stage distillation (appendix: second stage compresses two-model teacher into single model)."""
-
-    def __init__(self, config, tokenizer):
-        super().__init__(config, tokenizer)
-        self.teacher_model_f = None
-        self.teacher_model_g = None
-        self._is_resuming = (
-            config.checkpointing.resume_from_ckpt
-            and config.checkpointing.resume_ckpt_path is not None
-            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)
-        )
-
-    # ── teacher / student initialization ──────────────────────
-
-    def setup(self, stage: str):
-        if self.teacher_model_f is None or self.teacher_model_g is None:
-            self._initialize_teacher_f()
-            self._initialize_teacher_g()
-        if stage == 'fit' and not self._is_resuming:
-            print(">>> Initializing student from teacher...")
-            self._initialize_student_from_teacher()
-        elif self._is_resuming:
-            print(">>> Skipping student initialization (resuming from checkpoint).")
-
-    def _initialize_teacher_f(self):
-        self.teacher_model_f = self._load_teacher_model(
-            self.config.algo.teacher_f_path, use_plain_config=True)
-
-    def _initialize_teacher_g(self):
-        """Load the residual teacher model (uses current config, no plain override)."""
-        self.teacher_model_g = self._load_teacher_model(
-            self.config.algo.teacher_g_path, use_plain_config=False)
-
-    def _initialize_student_from_teacher(self):
-        self._copy_teacher_weights_to_student(self.teacher_model_f.state_dict())
-
-    # ── checkpoint hooks ──────────────────────────────────────
-
-    def on_train_start(self):
-        super().on_train_start()
-        if self.teacher_model_f is None or self.teacher_model_g is None:
-            print("Initializing teacher models...")
-            self._initialize_teacher_f()
-            self._initialize_teacher_g()
-            print("Initializing student from teacher")
-            self._initialize_student_from_teacher()
-
-    # ── teacher forwards ──────────────────────────────────────
-
-    def teacher_f_forward(self, xt, t):
-        """Forward through flow teacher model (returns log-probabilities)."""
-        sigma = self._process_sigma(t)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-                model_output = self.teacher_model_f(xt, sigma)
-        return self._process_model_output(model_output, xt, sigma)
-
-    def teacher_g_forward(self, xt, sigma, sigma_prime=None, **kwargs):
-        """Forward through residual teacher model (raw output, no softmax)."""
-        sigma = self._process_sigma(sigma)
-        if sigma_prime is not None:
-            sigma_prime = self._process_sigma(sigma_prime)
-        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-            model_output = self.teacher_model_g(
-                xt, sigma, sigma_prime, **kwargs)
-        return model_output
-
-    # ── loss ──────────────────────────────────────────────────
-
-    def loss(self, x0, output_tokens,
-             current_accumulation_step=None, train_mode=False,
-             xT=None, given_t=None, not_sampling_t=False):
-        del given_t, not_sampling_t, output_tokens
-        B = x0.shape[0]
-
-        d_sc = self._sample_t_interval(
-            B, current_accumulation_step,
-            t_min=0.0, t_max=1.0).clamp(min=1e-5, max=1.0)
-        t_sc = torch.rand(B, device=self.device) * (1.0 - d_sc)
-
-        if self.config.algo.add_boundary:
-            p_boundary = 1.0 / self.config.algo.boundary_prob
-            is_boundary = torch.rand(B, device=self.device) < p_boundary
-            t_sc = torch.where(is_boundary, torch.tensor(0.0, device=self.device), t_sc)
-            d_sc = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_sc)
-
-        c_t_sc = self._alpha_t_to_gamma(t_sc)
-        x_t_sc, _ = self.corrupt_continuous(x0, c_t_sc)
-        c_d_sc = self._alpha_t_to_gamma(t_sc + d_sc) - c_t_sc
-
-        f_final_f = self.teacher_f_forward(x_t_sc, t_sc).exp()
-        v_f = (f_final_f - x_t_sc) / (1.0 - c_t_sc.view(-1, 1, 1) + 1e-5)
-        f_final_g = self.teacher_g_forward(x_t_sc, t_sc, t_sc + d_sc)
-        F_s_t = (x_t_sc + v_f * c_d_sc.view(-1, 1, 1)
-                 + 0.5 * (c_d_sc.view(-1, 1, 1) ** 2) * f_final_g)
-
-        student_pred = self.forward(x_t_sc, t_sc, t_sc + d_sc).exp()
-        student_v = (student_pred - x_t_sc) / (1.0 - c_t_sc.view(-1, 1, 1) + 1e-5)
-        F_s_t_distilled = x_t_sc + c_d_sc.view(-1, 1, 1) * student_v
-
-        error = F_s_t - F_s_t_distilled
-        loss = (error ** 2).mean(dim=-1) * self.vocab_size
-
-        return loss
-
-    # ── sampling ──────────────────────────────────────────────
-
-    @torch.no_grad()
-    def generate_samples(self, num_samples, num_steps=None,
-                        eps=1e-5):
-        """
-        Generate samples using CTM-style gamma-sampling.
-        When gamma_sampling=0, this exactly recovers the original Euler deterministic path.
-        """
-        if num_steps is None:
-            num_steps = self.config.sampling.steps
-        gamma = getattr(self.config.sampling, 'gamma', 0.0)
-        print(f"Sampling with {num_steps} steps and gamma={gamma}")
-        B = num_samples
-        V = self.vocab_size
-        L = self.num_tokens
-        device = self.device
-
-        # Time grid in alpha space [0, 1]
-        alpha_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)  
-        z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
-        
-        for i in range(num_steps):                 
-            alpha_s = alpha_vals[i]
-            alpha_next = alpha_vals[i + 1]
-            
-            # Current physical time
-            s_in = self._alpha_t_to_gamma(alpha_s.expand(B))
-            
-            # 1. Calculate Target Physical Time via Gamma-Stochasticity logic
-            # For OTFlow: sigma = (1 - t). 
-            # CTM logic: sigma_tilde = sigma_target * sqrt(1 - gamma^2)
-            t_target_phys = self._alpha_t_to_gamma(alpha_next.expand(B))
-            sigma_target = 1.0 - t_target_phys
-            
-            sigma_tilde = sigma_target * torch.sqrt(torch.tensor(1.0 - gamma**2))
-            t_tilde = 1.0 - sigma_tilde # Intermediate physical jump point
-            
-            alpha_tilde = self._gamma_to_alphat(t_tilde) # Inverse mapping required
-            
-            log_D_st_pred = self.forward(z, alpha_s.expand(B), alpha_tilde)
-            D_st_pred = log_D_st_pred.exp()
-            print(self.tokenizer.decode(D_st_pred.argmax(dim=-1)[0]))
-
-            if i == num_steps - 1:
-                # At gamma_sampling=0, t_tilde is exactly 1.0, making weights (0, 1)
-                z = D_st_pred
-                break
-
-            weight_z = (1.0 - t_tilde.view(-1, 1, 1)) / (1.0 - s_in.view(-1, 1, 1))
-            weight_D = (t_tilde.view(-1, 1, 1) - s_in.view(-1, 1, 1)) / (1.0 - s_in.view(-1, 1, 1))
-
-            z_tilde = weight_z * z + weight_D * D_st_pred
-
-            if gamma > 0:
-                noise_std = gamma * sigma_target.view(-1, 1, 1)
-
-                mean_adjustment = (sigma_tilde.view(-1, 1, 1) - sigma_target.view(-1, 1, 1))
-                
-                z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
-            else:
-                z = z_tilde
-        print(self.tokenizer.decode(z.argmax(dim=-1)[0]))
-        return z.argmax(dim=-1)
     
 class FMLM(FLMBase):
-    """Flow-Map Language Model (FMLM): cross-entropy distillation via two-time denoiser (PSD / LSD / ESD).
-
-    Inherits shared utilities from FLMBase and adds:
-      - Two-time-step conditioning (s, t)
-      - Capped logit output processing
-      - Diagonal / off-diagonal loss sampling
-      - FMTG classifier guidance
-    """
 
     def __init__(self, config, tokenizer):
         super().__init__(config, tokenizer)
@@ -1471,14 +1120,10 @@ class FMLM(FLMBase):
         assert self.config.algo.double_temb == True, \
             "FMLM denoiser requires double time-emb conditioning to be True"
 
-
         assert type(self.config.algo.diagonal_fraction) == float, \
             "diagonal_fraction must be a float"
         assert 0 <= self.config.algo.diagonal_fraction <= 1, \
             "diagonal_fraction must be between 0 and 1"
-
-        assert self.config.algo.add_boundary == 'fixed', \
-            "FMLM denoiser only coded with fixed boundary sampling procedure"
 
         assert self.config.algo.distillation_method in ["PSD", "LSD", "ESD"], \
             "FMLM denoiser must distill using PSD, LSD, or ESD"
@@ -1488,15 +1133,8 @@ class FMLM(FLMBase):
             assert not self.config.algo.backprop_entmax_temp_lsd, \
                 "backprop_entmax_temp_lsd is not coded for LSD distillation"
 
-    def _process_model_output(self, model_output, xt, sigma, cap_value=30.0):
-        del xt, sigma
-        model_output = cap_value * torch.tanh(model_output / cap_value)
-        return model_output.log_softmax(dim=-1)
-
     def forward(self, xt, sigma, sigma_prime=None, use_jvp_attn=False, **kwargs):
-        """Forward pass; use_jvp_attn is accepted for API compatibility but unused in FLM DIT."""
-        del use_jvp_attn
-        return super().forward(xt, sigma, sigma_prime, **kwargs)
+        return super().forward(xt, sigma, sigma_prime, use_jvp_attn=use_jvp_attn, **kwargs)
 
     def forward_with_ema(self, *args, **kwargs):
         ema_to_use = self.ema
@@ -1520,16 +1158,6 @@ class FMLM(FLMBase):
             with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
                 model_output = self.teacher_model(xt, sigma)
         return self._process_model_output(model_output=model_output, xt=xt, sigma=sigma)
-
-    def teacher_forward_no_softmax(self, xt, tau):
-        """Returns capped logits from the frozen teacher (no log_softmax)."""
-        sigma = tau.unsqueeze(-1) if tau.ndim == 1 else tau
-        sigma = self._process_sigma(sigma)
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
-                model_output = self.teacher_model(xt, sigma)
-        cap_value = 30.0
-        return cap_value * torch.tanh(model_output / cap_value)
 
     def _d_tau_by_d_t(self, t):
         return utils.d_alpha_by_d_gamma(t, self.lut_g2a)
@@ -1569,47 +1197,8 @@ class FMLM(FLMBase):
         t_sorted, _ = torch.sort(t_all, dim=-1)
         return [t_sorted[:, i] for i in range(num_per_sample)]
 
-    def _sample_gap_t_interval(self, n, accum_step, t_min=None, t_max=None):
-        """Sample (s, t) via gap sampling, guaranteeing s <= t."""
-        if t_min is None:
-            t_min = self.t_min
-        if t_max is None:
-            t_max = self.t_max
-
-        if accum_step is not None:
-            batch_dim = n
-            total_n = self.config.loader.global_batch_size
-        else:
-            batch_dim = n
-            total_n = n
-
-        eps_d = torch.rand(total_n, device=self.device)
-        if self.antithetic_sampling:
-            offset = torch.arange(total_n, device=self.device) / total_n
-            eps_d = (eps_d / total_n + offset) % 1
-            perm = torch.randperm(total_n, device=self.device)
-            eps_d = eps_d[perm]
-        d = (t_max - t_min) * eps_d
-
-        eps_s = torch.rand(total_n, device=self.device)
-        s = t_min + eps_s * ((t_max - t_min) - d)
-        t = s + d
-
-        if accum_step is not None:
-            st = torch.stack([s, t], dim=1)
-            st = st.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
-            st = st.chunk(self.trainer.num_devices)[self.trainer.local_rank]
-            st = st.chunk(self.trainer.accumulate_grad_batches)[accum_step]
-            st = st[:batch_dim]
-            s, t = st[:, 0], st[:, 1]
-        else:
-            s = s[:batch_dim]
-            t = t[:batch_dim]
-
-        return s, t
-
     def _get_split_indices(self, n, accum_step, ratios):
-        """Split batch indices into category sets with balanced per-GPU counts."""
+        """Split batch indices into category sets"""
         assert sum(ratios) < 0.999, "Sum of ratios must be less than 1.0, leave one ratio out"
 
         batch_dim = n
@@ -1671,17 +1260,11 @@ class FMLM(FLMBase):
 
         tau_diag = self._sample_t_interval(B, current_accumulation_step,
                                            t_min=self.t_min, t_max=self.t_max)
-        sample_sut = getattr(self.config.algo, 'sample_sut', 'gap')
         set_midpoint = getattr(self.config.algo, 'set_midpoint', 'midpoint')
         if self.config.algo.offdiagonal_sampling == "uniform_st":
-            if sample_sut == 'gap':
-                tau_s_offdiag, tau_t_offdiag = self._sample_gap_t_interval(
-                    B, current_accumulation_step,
-                    t_min=self.t_min, t_max=self.t_max)
-            else:  # 'individual'
-                tau_s_offdiag, tau_t_offdiag = self._sample_multi_t_interval(
-                    B, current_accumulation_step, 2,
-                    t_min=self.t_min, t_max=self.t_max)
+            tau_s_offdiag, tau_t_offdiag = self._sample_multi_t_interval(
+                B, current_accumulation_step, 2,
+                t_min=self.t_min, t_max=self.t_max)
         else:  # uniform_diff
             tau_d_offdiag = self._sample_t_interval(
                 B, current_accumulation_step, t_min=self.t_min, t_max=self.t_max)
@@ -1921,3 +1504,301 @@ class FMLM(FLMBase):
                 
         return z.argmax(dim=-1)
 
+
+class FMLM_TwoModel(FLMBase):
+    """FMLM two-model parameterization (appendix: semigroup loss, first stage of two-stage MSE distillation)."""
+
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.log_flag = False
+        self.teacher_model = None
+        self._is_resuming = (
+            config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+        )
+
+    def setup(self, stage: str):
+        if self.teacher_model is None:
+            self._initialize_teacher()
+        if stage == 'fit' and not self._is_resuming:
+            print(">>> Initializing student from teacher...")
+            self._initialize_student_from_teacher()
+        elif self._is_resuming:
+            print(">>> Skipping student initialization (resuming from checkpoint).")
+
+    def _initialize_teacher(self):
+        self.teacher_model = self._load_teacher_model(
+            self.config.algo.teacher_path, use_plain_config=True)
+
+    def _initialize_student_from_teacher(self):
+        self._copy_teacher_weights_to_student(self.teacher_model.state_dict())
+        if hasattr(self.backbone, 'output_layer'):
+            self._zero_init_module(self.backbone.output_layer)
+            print("Zero initialized student output_layer")
+
+    def _on_load_checkpoint_extra(self, checkpoint):
+        if self.config.mode == 'sample_eval':
+            self._initialize_teacher()
+
+    def on_train_start(self):
+        super().on_train_start()
+        if self.teacher_model is None:
+            print("Initializing teacher model...")
+            self._initialize_teacher()
+            print("Initializing student from teacher")
+            self._initialize_student_from_teacher()
+
+    def teacher_forward(self, xt, tau):
+        tau = self._process_sigma(tau)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+                model_output = self.teacher_model(xt, tau)
+        return self._process_model_output(model_output, xt, tau)
+
+    def loss(self, x0, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens
+        B = x0.shape[0]
+
+        d_tau = self._sample_t_interval(
+            B, current_accumulation_step, t_min=0.0, t_max=1.0).clamp(min=1e-6)
+        tau_s = torch.rand(B, device=self.device) * (1.0 - d_tau)
+        if self.config.algo.add_boundary:
+            p_boundary = 1.0 / self.config.algo.boundary_prob
+            is_boundary = torch.rand(B, device=self.device) < p_boundary
+            tau_s = torch.where(is_boundary, torch.tensor(0.0, device=self.device), tau_s)
+            d_tau = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_tau)
+
+        t_s = self._tau_to_t(tau_s)
+        x_t_s, _ = self.corrupt_continuous(x0, t_s)
+        f_final_sc = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau)
+
+        with torch.no_grad():
+            d_tau_half = d_tau / 2.0
+            t_s = t_s.view(-1, 1, 1)
+
+            t_mid = self._tau_to_t(tau_s + d_tau_half).view(-1, 1, 1)
+            t_e = self._tau_to_t(tau_s + d_tau).view(-1, 1, 1)
+            dt_half_1 = t_mid - t_s
+            dt_half_2 = t_e - t_mid
+            dt = t_e - t_s
+
+            f_theta_s = self.teacher_forward(x_t_s, tau_s).exp()
+            v_s_hat = (f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
+            g_theta_s_u = self.forward_no_softmax(x_t_s, tau_s, tau_s + d_tau_half)
+
+            # v_su_hat = v_s(x_s) + 1/2(u-s)g_theta(x_s,u)
+            v_s_u_hat = ((f_theta_s - x_t_s) / (1.0 - t_s + 1e-5)
+                         + dt_half_1 / 2.0 * g_theta_s_u)
+
+            # F_s,u(x_s) = x_s + (u-s)v_s(x_s) + 1/2(u-s)^2 g_theta(x_s,u)
+            large_f_s_u = (x_t_s + dt_half_1 * v_s_hat
+                           + 0.5 * dt_half_1 ** 2 * g_theta_s_u)
+
+            f_theta_u = self.teacher_forward(large_f_s_u, tau_s + d_tau_half).exp()
+            v_u_hat = (f_theta_u - large_f_s_u) / (1.0 - t_mid + 1e-5)
+            g_theta_u_t = self.forward_no_softmax(
+                large_f_s_u, tau_s + d_tau_half, tau_s + d_tau)
+
+            # v_u,t_hat(x_u') = v_u(x_u') + 1/2*(t-u)*g_theta(x_u',u, t)
+            v_u_t_hat = v_u_hat + dt_half_2 / 2.0 * g_theta_u_t
+
+            v_hat = (dt_half_1 * v_s_u_hat + dt_half_2 * v_u_t_hat) / dt
+
+            # x_1_hat = stopgrad(x_s + (1-s)*v_hat)
+            x_boot = x_t_s + (1.0 - t_s) * v_hat
+            x_boot = x_boot.detach()
+
+        f_final_fm = f_theta_s
+        weight = 0.5 * dt * (1.0 - t_s)
+        f_final = f_final_fm + weight * f_final_sc
+        error = x_boot - f_final  # (B, L, V)
+        loss = (error ** 2).mean(dim=-1) * self.vocab_size  # (B, L)
+
+        if self.config.algo.learnable_loss_weighting is True:
+            loss_weight = self.backbone.learnable_loss_weighting(tau_s, tau_s + d_tau)
+            loss_weight = loss_weight.unsqueeze(-1)
+            loss = torch.exp(-loss_weight) * loss + loss_weight
+
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
+        """Generate samples using flow map."""
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        B = num_samples
+        V = self.vocab_size
+        L = self.num_tokens
+        device = self.device
+
+        z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+
+        for i in range(num_steps):
+            tau_curr = tau_vals[i]
+            tau_next = tau_vals[i + 1]
+            tau_in = tau_curr.expand(B)
+            t_in = self._tau_to_t(tau_in)
+            dt_in = self._tau_to_t(tau_next.expand(B)) - t_in
+
+            x_1_pred_fm = self.teacher_forward(z, tau_in).exp()
+            x_1_pred_sc = self.forward_no_softmax(z, tau_in, tau_next.expand(B))
+            v_pred = (x_1_pred_fm - z) / (1.0 - t_in.view(-1, 1, 1) + eps)
+            z = (z + v_pred * dt_in.view(-1, 1, 1)
+                 + 0.5 * (dt_in.view(-1, 1, 1) ** 2) * x_1_pred_sc)
+
+        return z.argmax(dim=-1)
+
+
+class FMLM_TwoStage(FLMBase):
+    """FMLM two-stage distillation (appendix: second stage compresses two-model teacher into single model)."""
+
+    def __init__(self, config, tokenizer):
+        super().__init__(config, tokenizer)
+        self.teacher_model_f = None
+        self.teacher_model_g = None
+        self._is_resuming = (
+            config.checkpointing.resume_from_ckpt
+            and config.checkpointing.resume_ckpt_path is not None
+            and utils.fsspec_exists(config.checkpointing.resume_ckpt_path)
+        )
+
+    def setup(self, stage: str):
+        if self.teacher_model_f is None or self.teacher_model_g is None:
+            self._initialize_teacher_f()
+            self._initialize_teacher_g()
+        if stage == 'fit' and not self._is_resuming:
+            print(">>> Initializing student from teacher...")
+            self._initialize_student_from_teacher()
+        elif self._is_resuming:
+            print(">>> Skipping student initialization (resuming from checkpoint).")
+
+    def _initialize_teacher_f(self):
+        self.teacher_model_f = self._load_teacher_model(
+            self.config.algo.teacher_f_path, use_plain_config=True)
+
+    def _initialize_teacher_g(self):
+        """Load the residual teacher model (uses current config, no plain override)."""
+        self.teacher_model_g = self._load_teacher_model(
+            self.config.algo.teacher_g_path, use_plain_config=False)
+
+    def _initialize_student_from_teacher(self):
+        self._copy_teacher_weights_to_student(self.teacher_model_f.state_dict())
+
+
+    def on_train_start(self):
+        super().on_train_start()
+        if self.teacher_model_f is None or self.teacher_model_g is None:
+            print("Initializing teacher models...")
+            self._initialize_teacher_f()
+            self._initialize_teacher_g()
+            print("Initializing student from teacher")
+            self._initialize_student_from_teacher()
+
+
+    def teacher_f_forward(self, xt, tau=None, d=None, use_jvp_attn=False):
+        del d, use_jvp_attn
+        sigma = tau.unsqueeze(-1) if tau.ndim == 1 else tau
+        sigma = self._process_sigma(sigma)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+                model_output = self.teacher_model_f(xt, sigma)
+        return self._process_model_output(model_output, xt, sigma)
+
+    def teacher_g_forward(self, xt, tau, tau_prime=None, **kwargs):
+        sigma = self._process_sigma(tau)
+        if tau_prime is not None:
+            sigma_prime = self._process_sigma(tau_prime)
+        else:
+            sigma_prime = None
+        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float32):
+            model_output = self.teacher_model_g(
+                xt, sigma, sigma_prime, **kwargs)
+        return model_output
+
+    def loss(self, x1, output_tokens,
+             current_accumulation_step=None, train_mode=False,
+             xT=None, given_t=None, not_sampling_t=False):
+        del given_t, not_sampling_t, output_tokens
+        B = x1.shape[0]
+
+        d_tau = self._sample_t_interval(
+            B, current_accumulation_step,
+            t_min=0.0, t_max=1.0).clamp(min=1e-5, max=1.0)
+        tau_s = torch.rand(B, device=self.device) * (1.0 - d_tau)
+
+        if self.config.algo.add_boundary:
+            p_boundary = 1.0 / self.config.algo.boundary_prob
+            is_boundary = torch.rand(B, device=self.device) < p_boundary
+            tau_s = torch.where(is_boundary, torch.tensor(0.0, device=self.device), tau_s)
+            d_tau = torch.where(is_boundary, torch.tensor(1.0, device=self.device), d_tau)
+
+        t_s = self._tau_to_t(tau_s)
+        x_t_s, _ = self.corrupt_continuous(x1, t_s)
+        dt = self._tau_to_t(tau_s + d_tau) - t_s
+
+        f_final_f = self.teacher_f_forward(x_t_s, tau_s).exp()
+        v_f = (f_final_f - x_t_s) / (1.0 - t_s.view(-1, 1, 1) + 1e-5)
+        f_final_g = self.teacher_g_forward(x_t_s, tau_s, tau_s + d_tau)
+        F_s_t = (x_t_s + v_f * dt.view(-1, 1, 1)
+                 + 0.5 * (dt.view(-1, 1, 1) ** 2) * f_final_g)
+
+        student_pred = self.forward(x_t_s, tau_s, tau_s + d_tau).exp()
+        student_v = (student_pred - x_t_s) / (1.0 - t_s.view(-1, 1, 1) + 1e-5)
+        F_s_t_distilled = x_t_s + dt.view(-1, 1, 1) * student_v
+
+        error = F_s_t - F_s_t_distilled
+        loss = (error ** 2).mean(dim=-1) * self.vocab_size
+
+        return loss
+
+    @torch.no_grad()
+    def generate_samples(self, num_samples, num_steps=None,
+                        eps=1e-5):
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+        gamma = getattr(self.config.sampling, 'gamma', 0.0)
+        print(f"Sampling with {num_steps} steps")
+        B = num_samples
+        V = self.vocab_size
+        L = self.num_tokens
+        device = self.device
+
+        tau_vals = torch.linspace(0.0, 1.0, num_steps + 1, device=device)  
+        z = torch.randn((num_samples, L, V), device=device, dtype=self.dtype)
+        
+        for i in range(num_steps):
+            tau_curr = tau_vals[i]
+            tau_next = tau_vals[i + 1]
+
+            t_curr = self._tau_to_t(tau_curr.expand(B))
+
+            t_next = self._tau_to_t(tau_next.expand(B))
+            sigma_target = 1.0 - t_next
+
+            sigma_tilde = sigma_target * torch.sqrt(torch.tensor(1.0 - gamma**2))
+            t_tilde = 1.0 - sigma_tilde
+            tau_tilde = self._t_to_tau(t_tilde)
+
+            log_D_st_pred = self.forward(z, tau_curr.expand(B), tau_tilde)
+            D_st_pred = log_D_st_pred.exp()
+
+            if i == num_steps - 1:
+                z = D_st_pred
+                break
+
+            weight_z = (1.0 - t_tilde.view(-1, 1, 1)) / (1.0 - t_curr.view(-1, 1, 1))
+            weight_D = ((t_tilde.view(-1, 1, 1) - t_curr.view(-1, 1, 1))
+                        / (1.0 - t_curr.view(-1, 1, 1)))
+            z_tilde = weight_z * z + weight_D * D_st_pred
+
+            if gamma > 0:
+                noise_std = gamma * sigma_target.view(-1, 1, 1)
+                mean_adjustment = sigma_tilde.view(-1, 1, 1) - sigma_target.view(-1, 1, 1)
+                z = z_tilde + mean_adjustment * D_st_pred + noise_std * torch.randn_like(z)
+            else:
+                z = z_tilde
+                
+        return z.argmax(dim=-1)

@@ -1,5 +1,5 @@
 #!/bin/bash
-CKPT_PATH="path/to/your/checkpoint.ckpt"
+CKPT_PATH="YOUR_CHECKPOINT_PATH"
 STEPS=32
 
 python -u -m main \

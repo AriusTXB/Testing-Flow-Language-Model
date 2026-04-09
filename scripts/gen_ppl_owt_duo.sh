@@ -53,7 +53,7 @@ python -u -m main \
     sampling.predictor=ancestral \
     +wandb.offline=true \
     eval.generated_samples_path=$checkpoint_path/samples_ancestral_greedy/$seed-$steps-$ckpt-$temperature-disable-ema-$disable_ema-llama3_1.json \
-    sampling.noise_removal=greedy \
+    sampling.noise_removal=ancestral \
     eval.disable_ema=$disable_ema \
     sampling.temperature=$temperature \
     +algo.use_curriculum=True
