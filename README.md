@@ -38,21 +38,6 @@ FLM applies the benefits of continuous image generation to discrete state spaces
 
 ## How to Run
 
-### Pretrained Checkpoints
-
-Pretrained FLM and FMLM checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1zjHxcyoPY7FL7_SAajToGEaNvVAglGps?usp=sharing).
-
-
-| Model | Dataset     | Checkpoint       |
-| ----- | ----------- | ---------------- |
-| FLM   | LM1B        | `lm1b_flm.ckpt`  |
-| FMLM  | LM1B        | `lm1b_fmlm.ckpt` |
-| FLM   | OpenWebText | `owt_flm.ckpt`   |
-| FMLM  | OpenWebText | `owt_fmlm.ckpt`  |
-
-
-Set `eval.checkpoint_path` (or `algo.teacher_path` for distillation) to the downloaded checkpoint path when running evaluation or distillation scripts.
-
 ### Install Dependencies
 
 ```bash
@@ -96,6 +81,27 @@ Set `CKPT_PATH` in the script to your trained checkpoint before running.
 | FLM   | OpenWebText | [scripts/gen_ppl_owt_flm.sh](scripts/gen_ppl_owt_flm.sh)     |
 | FMLM  | OpenWebText | [scripts/gen_ppl_owt_fmlm.sh](scripts/gen_ppl_owt_fmlm.sh)   |
 
+## Checkpoints
+### Pretrained Checkpoints
+
+Pretrained FLM and FMLM checkpoints are available at [here](https://drive.google.com/drive/folders/1fNAx4LP2RwPBdqDQFQ_gRrYZI9u3Vq15?usp=drive_link).
+
+
+| Model | Dataset     | Checkpoint       |
+| ----- | ----------- | ---------------- |
+| FLM   | LM1B        | `lm1b_flm.ckpt`  |
+| FMLM  | LM1B        | `lm1b_fmlm.ckpt` |
+| FLM   | OpenWebText | `owt_flm.ckpt`   |
+| FMLM  | OpenWebText | `owt_fmlm.ckpt`  |
+
+
+Set `eval.checkpoint_path` (or `algo.teacher_path` for distillation) to the downloaded checkpoint path when running evaluation or distillation scripts.
+
+### Baseline Checkpoints
+
+Reproduced baseline checkpoints are available at [here](https://drive.google.com/drive/folders/1TJO3aFWqI7ukbmjciZ6krAUFlAak1itl?usp=drive_link).
+
+For other checkpoints, mostly for OpenWebText, refer to [Duo](https://github.com/s-sahoo/duo), [SDTT](https://github.com/jdeschena/sdtt), [RDLM](https://github.com/harryjo97/RDLM), [di4c](https://github.com/sony/di4c) repositories.
 
 ## BibTeX
 
@@ -115,4 +121,4 @@ Set `CKPT_PATH` in the script to your trained checkpoint before running.
 
 ## Acknowledgements
 
-This codebase builds upon [DUO](https://github.com/s-sahoo/duo) and [ReDi](https://github.com/Ugness/ReDi)
+This codebase builds upon [Duo](https://github.com/s-sahoo/duo) and [ReDi](https://github.com/Ugness/ReDi)
