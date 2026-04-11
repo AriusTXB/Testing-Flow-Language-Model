@@ -1,3 +1,5 @@
+#!/bin/bash
+
 DATA_DIR="YOUR_DATA_DIR"
 
 python -u -m main \
