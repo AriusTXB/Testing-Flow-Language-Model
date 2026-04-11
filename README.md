@@ -99,7 +99,7 @@ Set `eval.checkpoint_path` (or `algo.teacher_path` for distillation) to the down
 
 ### Baseline Checkpoints
 
-Reproduced baseline checkpoints are available at [here](https://drive.google.com/drive/folders/1TJO3aFWqI7ukbmjciZ6krAUFlAak1itl?usp=drive_link).
+Reproduced baseline checkpoints for LM1B are available at [here](https://drive.google.com/drive/folders/1TJO3aFWqI7ukbmjciZ6krAUFlAak1itl?usp=drive_link).
 
 For other checkpoints, mostly for OpenWebText, refer to [Duo](https://github.com/s-sahoo/duo), [SDTT](https://github.com/jdeschena/sdtt), [RDLM](https://github.com/harryjo97/RDLM), [di4c](https://github.com/sony/di4c) repositories.
 
@@ -121,4 +121,4 @@ For other checkpoints, mostly for OpenWebText, refer to [Duo](https://github.com
 
 ## Acknowledgements
 
-This codebase builds upon [Duo](https://github.com/s-sahoo/duo) and [ReDi](https://github.com/Ugness/ReDi)
+This repository is built upon the codebases of **[Duo](https://github.com/s-sahoo/duo)** and **[ReDi](https://github.com/Ugness/ReDi)**.
