@@ -1,0 +1,162 @@
+import os
+import sys
+import torch
+import transformers
+import lightning.pytorch as L
+from omegaconf import OmegaConf
+
+# --- WORKFLOW ISOLATION ---
+CURRENT_DIR = os.getcwd()
+V4_SRC = os.path.join(CURRENT_DIR, "outputs/14_04_2026_Version_4/src")
+if os.path.exists(V4_SRC):
+    print(f"Injecting localized Version 4 logic: {V4_SRC}")
+    sys.path.insert(0, V4_SRC)
+
+import algo
+from reasoning_dataloader import get_reasoning_dataloader
+
+def main():
+    # 1. Manually resolve ALL nested keys to avoid Hydra interpolation errors
+    # This is a "Known-Good" flattened config based on successful LM1B runs.
+    config = OmegaConf.create({
+        "data": {
+            "vocab_size": 50258,
+            "train": "openwebtext",
+            "val": "openwebtext"
+        },
+        "model": {
+            "length": 256,
+            "backbone": "dit",
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "max_position_embeddings": 1024,
+            "dropout": 0.1,
+            "cond_dim": 128,
+            "n_blocks": 12,
+            "n_heads": 12,
+            "scale_by_sigma": True
+        },
+        "algo": {
+            "name": "flm",
+            "backbone": "dit",
+            "t_min": 0.0,
+            "t_max": 1.0,
+            "time_conditioning": True,
+            "double_temb": True,
+            "learnable_loss_weighting": False,
+            "parameterization": "mean",
+            "causal_attention": False,
+            "T": 0,
+            "ignore_bos": False
+        },
+        "noise": {
+            "type": "log-linear",
+            "eps": 0
+        },
+        "sampling": {
+            "steps": 1024,
+            "predictor": "ancestral",
+            "noise_removal": "ancestral",
+            "temperature": 1.0,
+            "top_k": 0,
+            "top_p": 1.0,
+            "p_nucleus": 1.0,
+            "use_float64": False,
+            "gamma": 0.0
+        },
+        "training": {
+            "loss_type": "flow",
+            "antithetic_sampling": True,
+            "importance_sampling": False,
+            "sampling_eps": 1e-3,
+            "not_sampling_t": False,
+            "accumulate_grad_batches": 4,
+            "ema": 0.999
+        },
+        "loader": {
+            "batch_size": 8,
+            "num_workers": 2,
+            "pin_memory": True,
+            "global_batch_size": 8,
+            "eval_batch_size": 1
+        },
+        "optim": {
+            "lr": 1e-4,
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "eps": 1e-8,
+            "weight_decay": 0.0
+        },
+        "checkpointing": {
+            "save_dir": "outputs/14_04_2026_Version_4",
+            "resume_from_ckpt": False
+        },
+        "eval": {
+            "checkpoint_path": "pretrained_weights/checkpoints/owt_flm.ckpt",
+            "disable_ema": False,
+            "gen_ppl_eval_model_name_or_path": "gpt2",
+            "batch_size": 1,
+            "sampling_steps": 50,
+            "perplexity_batch_size": 1,
+            "max_new_tokens": 128,
+            "stride": 128,
+            "n_samples": 1,
+            "eps": 1e-5,
+            "num_strides": 1,
+            "stride_length": 128,
+            "generate_samples_dt": 0.001,
+            "generated_samples_path": "outputs/14_04_2026_Version_4/samples.npy"
+        }
+    })
+    
+    # 2. Initialization
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    
+    print(f"Initializing Targeted Reasoner from: {config.eval.checkpoint_path}")
+    model = algo.FLM(config, tokenizer).to(device)
+    
+    if os.path.exists(config.eval.checkpoint_path):
+        checkpoint = torch.load(config.eval.checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        print("OWT weights loaded successfully.")
+
+    # 3. Data
+    train_loader = get_reasoning_dataloader(tokenizer, batch_size=config.loader.batch_size, max_length=config.model.length)
+    
+    # 4. Optimizer Policy
+    model.lr = config.optim.lr 
+    def custom_configure_optimizers():
+        optimizer = torch.optim.AdamW(model.parameters(), lr=model.lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+    model.configure_optimizers = custom_configure_optimizers
+
+    # 5. Trainer
+    checkpoint_callback = L.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(config.checkpointing.save_dir, "checkpoints"),
+        filename="reasoner-{epoch:02d}-{loss:.4f}",
+        save_top_k=3,
+        monitor="loss",
+        mode="min"
+    )
+
+    trainer = L.Trainer(
+        max_epochs=5,
+        accelerator="auto",
+        devices=1,
+        callbacks=[checkpoint_callback],
+        precision="bf16-mixed" if torch.cuda.is_available() else 32,
+        log_every_n_steps=10
+    )
+
+    # 6. Start
+    print("Starting Targeted Reasoner SFT (Total Flattened Config Mode)...")
+    trainer.fit(model, train_loader)
+
+if __name__ == "__main__":
+    main()

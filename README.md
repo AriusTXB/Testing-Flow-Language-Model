@@ -1,124 +1,53 @@
-<h1 align="center">Flow Map Language Models:<br>One-step Language Modeling via Continuous Denoising</h1>
+# Master Experiment Log - Flow Language Model (FLM)
 
-<div align="center">
-  
-**[Chanhyuk Lee](https://david3684.github.io)**<sup>1</sup>, **[Jaehoon Yoo](https://sites.google.com/view/jaehoon-yoo/홈)**<sup>1</sup>, **[Manan Agarwal](https://mananag007.github.io)**<sup>2</sup>, **[Sheel Shah](https://sheelfshah.github.io)**<sup>2</sup>, **[Jerry Huang](https://jrrhuang.github.io/)**<sup>2</sup>, \
-**[Aditi Raghunathan](https://www.cs.cmu.edu/~aditirag/)**<sup>2</sup>, **[Seunghoon Hong](https://maga33.github.io/)**<sup>1</sup>, **[Nicholas M. Boffi](https://nmboffi.github.io/)**<sup>†2</sup>, **[Jinwoo Kim](https://jw9730.github.io/)**<sup>†1</sup>
+This document tracks all Supervised Fine-Tuning (SFT) and Reasoning experiments conducted on the Flow Language Model.
 
+## Chronological Index
 
-
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Carnegie Mellon University &nbsp; <sup>†</sup>Equal advising
-</div>
-
-<div align="center">
-
-**[[Project Page]](https://one-step-lm.github.io/)** | **[[Paper]](https://arxiv.org/abs/2602.16813)** | **[[Blog]](https://arxiv.org/abs/2602.16813)**
-
-</div>
-
-## News
-
-- **[2026-04]** We released LM1B/OpenWebText checkpoints for FLM and FMLM. 
-
-## TL;DR
-
-<p align="center">
-  <img src="figures/overview.gif" width="100%">
-</p>
-
-<p align="center">
-  <img src="figures/overview.png" width="100%">
-</p>
-
-We introduce **Flow Language Model (FLM)** and its flow-map distilled variant **Flow Map Language Model (FMLM)**, enabling **one-step parallel text generation** through continuous denoising. 
-
-## Overview
-
-FLM applies the benefits of continuous image generation to discrete state spaces by encoding text as one-hot vectors and using flow matching to directly map noise to one-hot data. Unlike discrete diffusion, FLM **gradually denoises all tokens in parallel**, allowing it to represent a superposition of sequences while capturing correlations between tokens — a fundamental bottleneck for discrete diffusion in the few-step regime.
-
-## How to Run
-
-### Install Dependencies
-
-```bash
-pip install torch>=2.3.0
-pip install -r requirements.txt
-# Install flash-attn separately matching your python / torch version (see https://github.com/Dao-AILab/flash-attention/releases)
-pip install flash-attn==2.8.3 --no-build-isolation
-```
-
-Our DiT backbone supports `torch.compile` with `max-autotune` for faster training. Enable it by setting the environment variable before running any script:
-
-```bash
-export DIT_USE_COMPILE=TRUE
-```
-
-With the option, we are able to train OpenWebText experiments with 512 batch size on 8 H100 (80GB VRAM), without gradient accumulation.
-
-### Training
-
-Before running, update `data.cache_dir` in the scripts to point to your dataset location. If the directory is empty, the dataset will be automatically downloaded and preprocessed.
-
-Set `algo.teacher_path` to your pre-trained FLM checkpoint before running FMLM distillation.
-
-
-| Model | Dataset     | Script                                                                     |
-| ----- | ----------- | -------------------------------------------------------------------------- |
-| FLM   | LM1B        | [scripts/train_lm1b_flm.sh](scripts/train_lm1b_flm.sh)                     |
-| FMLM  | LM1B        | [scripts/train_lm1b_fmlm_denoiser.sh](scripts/train_lm1b_fmlm_denoiser.sh) |
-| FLM   | OpenWebText | [scripts/train_owt_flm.sh](scripts/train_owt_flm.sh)                       |
-| FMLM  | OpenWebText | [scripts/train_owt_fmlm_denoiser.sh](scripts/train_owt_fmlm_denoiser.sh)   |
-
-### Evaluation
-
-Set `CKPT_PATH` in the script to your trained checkpoint before running.
-
-
-| Model | Dataset     | Script                                                       |
-| ----- | ----------- | ------------------------------------------------------------ |
-| FLM   | LM1B        | [scripts/gen_ppl_lm1b_flm.sh](scripts/gen_ppl_lm1b_flm.sh)   |
-| FMLM  | LM1B        | [scripts/gen_ppl_lm1b_fmlm.sh](scripts/gen_ppl_lm1b_fmlm.sh) |
-| FLM   | OpenWebText | [scripts/gen_ppl_owt_flm.sh](scripts/gen_ppl_owt_flm.sh)     |
-| FMLM  | OpenWebText | [scripts/gen_ppl_owt_fmlm.sh](scripts/gen_ppl_owt_fmlm.sh)   |
-
-## Checkpoints
-### Pretrained Checkpoints
-
-Pretrained FLM and FMLM checkpoints are available at [here](https://drive.google.com/drive/folders/1fNAx4LP2RwPBdqDQFQ_gRrYZI9u3Vq15?usp=drive_link).
-
-
-| Model | Dataset     | Checkpoint       |
-| ----- | ----------- | ---------------- |
-| FLM   | LM1B        | `lm1b_flm.ckpt`  |
-| FMLM  | LM1B        | `lm1b_fmlm.ckpt` |
-| FLM   | OpenWebText | `owt_flm.ckpt`   |
-| FMLM  | OpenWebText | `owt_fmlm.ckpt`  |
-
-
-Set `eval.checkpoint_path` (or `algo.teacher_path` for distillation) to the downloaded checkpoint path when running evaluation or distillation scripts.
-
-### Baseline Checkpoints
-
-Reproduced baseline checkpoints for LM1B are available at [here](https://drive.google.com/drive/folders/1TJO3aFWqI7ukbmjciZ6krAUFlAak1itl?usp=drive_link).
-
-For other checkpoints, mostly for OpenWebText, refer to [Duo](https://github.com/s-sahoo/duo), [SDTT](https://github.com/jdeschena/sdtt), [RDLM](https://github.com/harryjo97/RDLM), [di4c](https://github.com/sony/di4c) repositories.
-
-## BibTeX
-
-```bibtex
-@article{lee2026flow,
-    title={Flow Map Language Models: One-step Language Modeling via Continuous Denoising},
-    author={Chanhyuk Lee and Jaehoon Yoo and Manan Agarwal
-            and Sheel Shah and Jerry Huang
-            and Aditi Raghunathan and Seunghoon Hong
-            and Nicholas M. Boffi and Jinwoo Kim},
-    journal={arXiv preprint arXiv:2602.16813},
-    year={2026},
-}
-```
+| Date | Folder | Base Model | Goal | Result / Outcome |
+| :--- | :--- | :--- | :--- | :--- |
+| **13/04/2026** | `outputs/13_04_2026_Version_1` | **LM1B** (139M) | Initial Chat SFT | Successfully aligned to instructions. Prompt clamping verified. Passed simple math test. |
+| **14/04/2026** | `outputs/14_04_2026_Version_1` | **LM1B** (139M) | Reasoning Benchmark | Baseline assessment for Zero-Shot/Few-Shot/CoT. Limited by model scale. |
+| **14/04/2026** | `outputs/14_04_2026_Version_2` | **OWT** (50k Vocab) | High-Vocab Alignment | Successfully resolved UniCode collapse using Logit Masks. Achieved fluent English. |
+| **14/04/2026** | `outputs/14_04_2026_Version_3` | **OWT-Fidelity** | Tiny Benchmark | Verified coherence but identified "Article Bias" (rambling). Logic EM: 0%. |
+| **14/04/2026** | `outputs/14_04_2026_Version_4` | **OWT + Reasoning** | Logic Augmentation | Training on GSM8K + Alpaca mix to break generative priors. Encountered catastrophic forgetting/gradient spike. |
+| **14/04/2026** | `outputs/14_04_2026_Version_5` | **OWT + SFT Stabilized** | Smooth Alignment | 20 Epochs, clipped grads, low LR (3e-5). Model converges but ignores logic conditioning without CFG. |
+| **Active** | `outputs/14_04_2026_Version_6` | **OWT + CFG Anchor** | CFG Null Training | Rewrote Dataloader for 15% prefix dropout. Model learns unconditional anchor. Generative capacity limit verified. |
 
 ---
 
-## Acknowledgements
+## Technical History (Summaries)
 
-This repository is built upon the codebases of **[Duo](https://github.com/s-sahoo/duo)** and **[ReDi](https://github.com/Ugness/ReDi)**.
+### 1. Version 1 (LM1B)
+- **Tokenization**: `bert-base-uncased` (30.5k tokens).
+- **Setup**: SFT on cleaned Alpaca dataset. 
+- **Discovery**: The model showed "Arithmetic Discovery"—it could solve $5+3=8$ after alignment, even though it was originally trained on random news text.
+
+### 2. Version 2 (OWT)
+- **Tokenization**: `gpt2` + added `[PAD]` (50,258 tokens).
+- **Discovery**: Successfully resolved "Unicode Collapse" using Logit Masks.
+- **Current Status**: Baseline for instruction following.
+
+### 3. Version 3 (The Benchmark)
+- **Status**: Completed.
+- **Discovery**: OWT models generate clean text but treat reasoning prompts as "writing topics."
+- **Failure Mode**: When asked $1+1$, the model writes a paragraph about why math is important rather than saying $2$.
+
+### 4. Version 4 (Targeted Reasoner - Unstable)
+- **Paradigim**: Simplex Flow Matching on One-Hot Encodings.
+- **Focus**: Mixing GSM8K (7.5k math) into the instruction set.
+- **Outcome**: Divergence due to aggressive learning rate ($1 \times 10^{-4}$) clashing with OpenWebText base-vector field.
+
+### 5. Version 5 (Stabilized Reasoning SFT & CFG)
+- **Modifications**: Extended to 20 epochs, reduced LR ($3 \times 10^{-5}$), batch accumulation to 8 (eff 64), added linear warmup, and gradient clipping at 1.0.
+- **Status**: Completed SFT convergence ($Loss \approx 4.17$). Model successfully avoids Unicode collapse and produces highly fluent English words.
+- **Discovery**: Testing via Tiny Benchmark revealed the 139M Flow Language Model ignores instruction-prompt conditions completely, favoring the unconditional "Article Mode" prior.
+- **CFG Experiment**: Implemented Classifier-Free Guidance ($v = v_{uncond} + 2.0 \cdot (v_{cond} - v_{uncond})$) using `[PAD]` sequence substitution during inference.
+- **CFG Outcome**: Failed structurally. The unconditional vector field produced out-of-distribution noise because the model pre-training lacked a native "null condition" dropout. However, we proved SFT modified the vector field significantly as the model outputted disjointed math vocabulary (`5<<<< 16 because they 50 each them number`) showing generative shift.
+- **Next Step Requirement**: Rewrite the data loaders to introduce a 10-15% probability of randomly dropping the instruction prefix during training, cementing an explicit mathematical anchor for CFG generation.
+
+### 6. Version 6 (CFG Dropout Anchor)
+- **Modifications**: Modified `reasoning_dataloader.py` to drop the instruction prefix (`[PAD]` replacement) in 15% of samples while retaining `attention_mask = 1.0`. Evaluated using CFG 2.0.
+- **Status**: Completed ($Loss \approx 1.04$). The generative SFT objective is fully solved.
+- **Final Discovery**: The 139M Simplex Flow Language Model still exhibits generative collapse during logic logic generation even with a properly trained CFG anchor.
+- **Architectural Conclusion**: Flow Matching is geometrically complex compared to Autoregressive models. 139M parameters lack the representational depth to follow zero-shot mathematical/structural syntax securely over a 256 sequence context. Scaling to $\geq 1$ Billion parameters is functionally mandatory to resolve logic alignment.
